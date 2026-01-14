@@ -11,6 +11,8 @@ export CUDA_HOME=/path/to/cuda
 For a "Hello world"-sized example, please run the following command (10 minutes):
 ```
 python -m flexgen.flex_opt --model huggingface/opt-6.7b --percent 100 0 0 100 100 0 --overlap false --gpu-batch-size 2 --num-gpu-batches 1 --prompt-len 384 --gen-len 128 --warmup-input-path flexgen/pg19_firstbook.txt --test-input-path flexgen/pg19_firstbook.txt --alpha 4 --partial-weight-ratio 0.2 --max-num-kv 102
+
+python -m flexgen.flex_opt --model /root/autodl-tmp/Qwen3-8B --percent 100 0 0 100 100 0 --overlap false --gpu-batch-size 2 --num-gpu-batches 1 --prompt-len 384 --gen-len 128 --warmup-input-path flexgen/pg19_firstbook.txt --test-input-path flexgen/pg19_firstbook.txt --alpha 4 --partial-weight-ratio 0.2 --max-num-kv 102
 ```
 ## Run Experiments (7 hours)
 We provide scripts to reproduce the experiment results from Figure 14 to Figure 17. To reproduce all the results at once, please run the following commands (7 hours).

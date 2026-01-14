@@ -526,6 +526,34 @@ class OptLM:
         self.policy = policy
         self.num_gpu_batches = policy.num_gpu_batches
 
+        # ---- load state_dict from safetensors ----
+        print(f"Loading model from safetensors in: {path}")
+        safetensor_files = sorted([f for f in os.listdir(path) if f.endswith(".safetensors")])
+        if not safetensor_files:
+            raise FileNotFoundError(f"No .safetensors files found in {path}")
+
+        state_dict = {}
+        for f in safetensor_files:
+            file_path = os.path.join(path, f)
+            print(f"Loading {file_path}...")
+            tensors = load_file(file_path, device="cpu")
+            state_dict.update(tensors)
+        print(f"Loaded {len(state_dict)} tensors.")
+        self.model_state_dict = state_dict
+
+        q_proj = self.model_state_dict.get("model.layers.0.self_attn.q_proj.weight")
+        k_proj = self.model_state_dict.get("model.layers.0.self_attn.k_proj.weight")
+        if q_proj is not None:
+            hidden_size = q_proj.shape[0]
+            head_dim = hidden_size // self.config.num_attention_heads
+            self.config.hidden_size = hidden_size
+            if hasattr(self.config, "head_dim"):
+                self.config.head_dim = head_dim
+            if k_proj is not None:
+                kv_head = k_proj.shape[0] // head_dim
+                if hasattr(self.config, "num_key_value_heads"):
+                    self.config.num_key_value_heads = kv_head
+
         self.head_num = getattr(self.config, "num_key_value_heads", self.config.num_attention_heads)
         self.head_dim = getattr(self.config, "head_dim", self.config.hidden_size // self.config.num_attention_heads)
         cache_dtype = torch.float16
@@ -545,21 +573,6 @@ class OptLM:
             gpu_cache_pred=2,
             cpu_cache_pred=2
         )
-
-        # ---- load state_dict from safetensors ----
-        print(f"Loading model from safetensors in: {path}")
-        safetensor_files = sorted([f for f in os.listdir(path) if f.endswith(".safetensors")])
-        if not safetensor_files:
-            raise FileNotFoundError(f"No .safetensors files found in {path}")
-
-        state_dict = {}
-        for f in safetensor_files:
-            file_path = os.path.join(path, f)
-            print(f"Loading {file_path}...")
-            tensors = load_file(file_path, device="cpu")
-            state_dict.update(tensors)
-        print(f"Loaded {len(state_dict)} tensors.")
-        self.model_state_dict = state_dict
 
         # ---- build layers ----
         self.layers = []
@@ -956,14 +969,14 @@ def run_flexgen(args):
         max_num_kv=args.max_num_kv
     )
 
-    head_dim = getattr(qwen_config, "head_dim",
-                       qwen_config.hidden_size // qwen_config.num_attention_heads)
-    for l in range(qwen_config.num_hidden_layers):
+    head_dim = model.head_dim
+    head_num = model.head_num
+    for l in range(model.config.num_hidden_layers):
         model._cache_manager.add_cache(
             device="cuda:0",
             layer_id=l,
             batch_size=num_prompts,
-            head_num=getattr(qwen_config, "num_key_value_heads", qwen_config.num_attention_heads),
+            head_num=head_num,
             sparse_len=args.max_num_kv,
             hidden_size=head_dim
         )

@@ -1,0 +1,49 @@
+{
+    // 使用 IntelliSense 了解相关属性。 
+    // 悬停以查看现有属性的描述。
+    // 欲了解更多信息，请访问: https://go.microsoft.com/fwlink/?linkid=830387
+    "version": "0.2.0",
+    "configurations": [
+
+        {
+            "name": "Python: flexgen.flex_opt (Qwen3-8B)",
+            "type": "debugpy",
+            "request": "launch",
+            "module": "flexgen.flex_opt",
+            "console": "integratedTerminal",
+            "justMyCode": false,
+            "cwd": "${workspaceFolder}",
+            "args": [
+                "--model",
+                "/root/autodl-tmp/Qwen3-8B",
+                "--percent",
+                "100",
+                "0",
+                "0",
+                "100",
+                "100",
+                "0",
+                "--overlap",
+                "false",
+                "--gpu-batch-size",
+                "1",
+                "--num-gpu-batches",
+                "1",
+                "--prompt-len",
+                "8196",
+                "--gen-len",
+                "512",
+                "--warmup-input-path",
+                "speedup/flexgen/pg19_firstbook.txt",
+                "--test-input-path",
+                "speedup/flexgen/pg19_firstbook.txt",
+                "--alpha",
+                "4",
+                "--partial-weight-ratio",
+                "0.2",
+                "--max-num-kv",
+                "2048"
+            ]
+        }
+    ]
+}

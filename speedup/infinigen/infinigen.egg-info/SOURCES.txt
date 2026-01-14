@@ -1,0 +1,5 @@
+setup.py
+infinigen.egg-info/PKG-INFO
+infinigen.egg-info/SOURCES.txt
+infinigen.egg-info/dependency_links.txt
+infinigen.egg-info/top_level.txt

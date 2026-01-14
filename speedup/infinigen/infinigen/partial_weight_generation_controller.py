@@ -65,6 +65,62 @@ def set_partial_cache(k_cache, partial_index, n_head, head_dim):
     return partial_cache.view(n, bh, -1)
 
 
+def set_partial_cache_gqa(raw_k_cache, partial_index, n_head, n_kv_head, head_dim):
+    """
+    Builds partial key cache for GQA by:
+    1. Repeating the key cache from n_kv_head to n_head (GQA expansion)
+    2. Gathering important columns within each head as specified by partial_index.
+
+    Args:
+        raw_k_cache: Raw key cache before repeat, shape (s, b * n_kv_head, head_dim)
+        partial_index: Indices of important columns, shape (b, n_head, d_prime)
+                       Each value in partial_index[b, h, :] is in [0, head_dim)
+        n_head: Total number of query heads
+        n_kv_head: Number of key/value heads
+        head_dim: Dimension per head (d)
+
+    Returns:
+        partial_k_cache: Partial key cache after repeat and column selection, shape (s, b * n_head, d_prime)
+    """
+    s, total_kv_size, d = raw_k_cache.shape
+    b = total_kv_size // n_kv_head  # batch size
+    d_prime = partial_index.shape[-1]
+    rep = n_head // n_kv_head
+
+    assert d == head_dim, f"head_dim mismatch: got {d}, expected {head_dim}"
+    assert n_head % n_kv_head == 0, "n_head must be divisible by n_kv_head"
+    assert partial_index.shape == (b, n_head, d_prime), f"partial_index shape should be (b={b}, h={n_head}, d'={d_prime})"
+
+    # Step 1: Reshape to (s, b, n_kv_head, head_dim)
+    k = raw_k_cache.view(s, b, n_kv_head, head_dim)
+
+    # Step 2: Repeat each KV head `rep` times to match n_head
+    # → (s, b, n_kv_head, rep, head_dim) → (s, b, n_head, head_dim)
+    k_expanded = k.unsqueeze(3) \
+                   .expand(s, b, n_kv_head, rep, head_dim) \
+                   .reshape(s, b, n_head, head_dim)  # now each Q head has its K
+
+    # Step 3: Gather important columns within each head
+    # k_expanded: (s, b, n_head, head_dim)
+    # partial_index: (b, n_head, d_prime)
+    # We want: for each (b, h), gather k_expanded[*, b, h, :] at indices partial_index[b, h, :]
+
+    # Expand partial_index to (s, b, n_head, d_prime)
+    idx_expanded = partial_index.unsqueeze(0).expand(s, b, n_head, d_prime)  # (s, b, h, d')
+
+    # Use torch.gather on the last dimension
+    k_partial = torch.gather(
+        k_expanded,      # (s, b, n_head, head_dim)
+        dim=3,
+        index=idx_expanded  # (s, b, n_head, d_prime)
+    )  # → (s, b, n_head, d_prime)
+
+    # Step 4: Reshape to (s, b * n_head, d_prime)
+    partial_k_cache = k_partial.reshape(s, b * n_head, d_prime)
+
+    return partial_k_cache
+
+
 def set_partial_weight(w_q, partial_index, n_head, head_dim):
     """Sets the partial query weight.
 
