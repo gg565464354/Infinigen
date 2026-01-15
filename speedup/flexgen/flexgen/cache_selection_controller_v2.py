@@ -337,7 +337,7 @@ class CacheManager:
 
             for i in range(len(group_cached_gpu_k)):
                 group_final_k.append((group_cached_gpu_k[i], unhit_gpu_k[i]))
-                group_final_v.append((group_cached_gpu_k[i], unhit_gpu_k[i]))
+                group_final_v.append((group_cached_gpu_v[i], unhit_gpu_v[i]))
 
         # transfer_stream.synchronize()
         
