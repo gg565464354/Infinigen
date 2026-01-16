@@ -1,4 +1,8 @@
 setup.py
+infinigen/__init__.py
+infinigen/kv_selection_controller.py
+infinigen/partial_weight_generation_controller.py
+infinigen/skewing_controller.py
 infinigen.egg-info/PKG-INFO
 infinigen.egg-info/SOURCES.txt
 infinigen.egg-info/dependency_links.txt

@@ -2,10 +2,17 @@ LICENSE
 README.md
 pyproject.toml
 flexgen/__init__.py
+flexgen/cache_selection_controller_v2.py
 flexgen/compression.py
 flexgen/flex_opt.py
+flexgen/flex_opt_mycache.py
+flexgen/flex_opt_qwen.py
+flexgen/flex_opt_qwen_infinigen.py
+flexgen/flex_opt_qwen_mycache_MHA.py
+flexgen/flex_opt_qwen_mycache_MHA_v0.py
 flexgen/opt_config.py
 flexgen/pytorch_backend.py
+flexgen/pytorch_backend_backup.py
 flexgen/timer.py
 flexgen/utils.py
 flexgen.egg-info/PKG-INFO

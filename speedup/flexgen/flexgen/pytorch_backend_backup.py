@@ -36,6 +36,56 @@ global_disk_device = None
 # Optional override for link I/O time (debugging / simulation)
 force_io_time = None
 
+
+def speculate_attention_grouped(hidden, p_w_q, p_k_c, n_head, n_kv_head, max_num_kv, group_size=4):
+    """Speculates token indices by averaging scores across head groups and selecting top groups."""
+    b = hidden.shape[0]
+    p_q = F.linear(hidden, p_w_q, bias=None)
+    p_q = p_q.view(b, 1, n_head, -1)
+    p_q = p_q.permute(0, 2, 1, 3).reshape(b * n_head, 1, -1)
+
+    p_attn = torch.bmm(p_q, p_k_c.permute(1, 2, 0))  # (b*n_head, 1, n)
+    p_attn = p_attn.squeeze(1).view(b, n_head, -1)
+    if n_kv_head is None:
+        n_kv_head = n_head
+    rep = max(1, n_head // n_kv_head)
+    p_attn = p_attn.view(b, n_kv_head, rep, -1).mean(dim=2)  # (b, n_kv, n)
+    token_scores = p_attn.reshape(b * n_kv_head, -1)  # (b*n_kv, n)
+
+    n = token_scores.shape[1]
+    if n == 0:
+        return None, None
+
+    group_size = max(1, int(group_size))
+    group_count = (n + group_size - 1) // group_size
+    pad_len = group_count * group_size - n
+    if pad_len:
+        pad = torch.full((token_scores.shape[0], pad_len), -float("inf"),
+                         device=token_scores.device, dtype=token_scores.dtype)
+        token_scores = torch.cat([token_scores, pad], dim=1)
+
+    group_scores = token_scores.view(token_scores.shape[0], group_count, group_size).max(dim=2).values
+    max_groups = max(1, min(max_num_kv // group_size, group_count))
+    topk_groups = torch.topk(group_scores, k=max_groups, dim=1).indices  # (b*n_kv, g)
+
+    offsets = torch.arange(group_size, device=token_scores.device)
+    token_idx = topk_groups.unsqueeze(-1) * group_size + offsets  # (b, g, G)
+    token_idx = token_idx.reshape(token_scores.shape[0], -1)  # (b*n_kv, L)
+
+    invalid_mask = token_idx >= n
+    if invalid_mask.any():
+        token_idx = torch.where(invalid_mask, torch.full_like(token_idx, n - 1), token_idx)
+
+    prefetch_idx = token_idx.transpose(0, 1).unsqueeze(1)
+
+    if invalid_mask.any():
+        pad_idx = invalid_mask.transpose(0, 1).unsqueeze(1).to(torch.int32)
+    else:
+        pad_idx = torch.zeros((prefetch_idx.shape[0], 1, prefetch_idx.shape[2]),
+                              device=prefetch_idx.device, dtype=torch.int32)
+
+    return prefetch_idx, pad_idx
+
 # def repeat_kv(x: torch.Tensor, n_rep: int):
 #     """Repeats key/value tensors along the head dimension.
     
@@ -460,7 +510,8 @@ class TorchDevice:
     
     def init_cache_one_gpu_batch_infin(self, config, task, policy):
         num_head, hidden_size, prompt_len, gen_len, gpu_batch_size = (
-            config.num_attention_heads, config.hidden_size, task.prompt_len, task.gen_len,
+            getattr(config, "num_key_value_heads", config.num_attention_heads),
+            config.hidden_size, task.prompt_len, task.gen_len,
             policy.gpu_batch_size)
         shape = (prompt_len + gen_len - 1, gpu_batch_size * num_head, config.head_dim)
         # NOTE: disable pin_memory due to high memory overhead
@@ -943,12 +994,9 @@ class TorchDevice:
 
         # Reshape: (b, s, h) -> (b, s, n_head/n_kv, head_dim)
         q = q.view(b, s, n_head, head_dim)
-        if is_mha:
-            k = k.view(b, s, n_head, head_dim)
-        else:
-            k = k.view(b, s, num_key_value_heads, head_dim)
-            
-        v = v.view(b, s, num_key_value_heads, head_dim)
+        kv_head = n_head if is_mha else num_key_value_heads
+        k = k.view(b, s, kv_head, head_dim)
+        v = v.view(b, s, kv_head, head_dim)
 
         # Q/K Norm
         q = rms_norm(q, weight=q_ln, eps=eps) * scaling
@@ -962,10 +1010,15 @@ class TorchDevice:
         # Apply RoPE
         q, k = apply_rotary_pos_emb(q, k, cos, sin, unsqueeze_dim=1)
 
-        # GQA: repeat k/v after RoPE → (b, n_head, s, d)
+        # GQA: repeat k/v for attention only, keep base for cache
+        k_base = k
+        v_base = v
         if not is_mha:
-            k = repeat_kv(k, num_key_value_groups)
-        v = repeat_kv(v, num_key_value_groups)
+            k = repeat_kv(k_base, num_key_value_groups)
+            v = repeat_kv(v_base, num_key_value_groups)
+        else:
+            k = k_base
+            v = v_base
 
         # Skew mechanism during warmup
         if warmup:
@@ -987,9 +1040,9 @@ class TorchDevice:
         if donate[0]: inputs.delete()
         if donate[1]: attention_mask.delete()
 
-        # KV Cache: (s, b * n_head, head_dim)
-        k_cache = k.permute(2, 0, 1, 3).reshape(s, b * n_head, head_dim)
-        v_cache = v.permute(2, 0, 1, 3).reshape(s, b * n_head, head_dim)
+        # KV Cache: (s, b * n_kv_head, head_dim)
+        k_cache = k_base.permute(2, 0, 1, 3).reshape(s, b * kv_head, head_dim)
+        v_cache = v_base.permute(2, 0, 1, 3).reshape(s, b * kv_head, head_dim)
 
         if compress_cache:
             k_cache = self.compressed_device.compress(k_cache, comp_config)
@@ -1209,12 +1262,9 @@ class TorchDevice:
 
         # Reshape: (b, s, h) -> (b, s, n_head/n_kv, head_dim)
         q = q.view(b, s, n_head, head_dim)
-        if is_mha:
-            k = k.view(b, s, n_head, head_dim)
-        else:
-            k = k.view(b, s, num_key_value_heads, head_dim)
-            
-        v = v.view(b, s, num_key_value_heads, head_dim)
+        kv_head = n_head if is_mha else num_key_value_heads
+        k = k.view(b, s, kv_head, head_dim)
+        v = v.view(b, s, kv_head, head_dim)
 
         # Q/K Norm
         q = rms_norm(q, weight=q_ln, eps=eps) * scaling
@@ -1228,10 +1278,15 @@ class TorchDevice:
         # Apply RoPE
         q, k = apply_rotary_pos_emb(q, k, cos, sin, unsqueeze_dim=1)
 
-        # GQA: repeat k/v after RoPE → (b, n_head, s, d)
+        # GQA: repeat k/v for attention only, keep base for cache
+        k_base = k
+        v_base = v
         if not is_mha:
-            k = repeat_kv(k, num_key_value_groups)
-        v = repeat_kv(v, num_key_value_groups)
+            k = repeat_kv(k_base, num_key_value_groups)
+            v = repeat_kv(v_base, num_key_value_groups)
+        else:
+            k = k_base
+            v = v_base
 
         # Skew mechanism during warmup
         if warmup:
@@ -1268,9 +1323,9 @@ class TorchDevice:
         if donate[0]: inputs.delete()
         if donate[1]: attention_mask.delete()
 
-        # KV Cache: (s, b * n_head, head_dim)
-        k_cache = k.permute(2, 0, 1, 3).reshape(s, b * n_head, head_dim)
-        v_cache = v.permute(2, 0, 1, 3).reshape(s, b * n_head, head_dim)
+        # KV Cache: (s, b * n_kv_head, head_dim)
+        k_cache = k_base.permute(2, 0, 1, 3).reshape(s, b * kv_head, head_dim)
+        v_cache = v_base.permute(2, 0, 1, 3).reshape(s, b * kv_head, head_dim)
 
         if compress_cache:
             k_cache = self.compressed_device.compress(k_cache, comp_config)
@@ -1287,7 +1342,8 @@ class TorchDevice:
                               k_cache, v_cache, donate,
                               attn_sparsity, compress_cache, comp_config,
                               eps, head_dim, num_key_value_groups, num_key_value_heads, position_embeddings,
-                              p_w_q, partial_k_cache, speculation_stream, alpha, max_num_kv, attn_topk=None):
+                              p_w_q, partial_k_cache, speculation_stream, alpha, max_num_kv, attn_topk=None,
+                              prefetch_grouped=False):
         """Decoding-phase MHA with prefetch_idx generation via speculative attention."""
         b, tgt_s, h = inputs.shape
         src_s = attention_mask.shape[1]
@@ -1301,24 +1357,37 @@ class TorchDevice:
 
         # --- Speculative Attention: Generate prefetch_idx ---
         prefetch_idx = None
+        pad_idx = None
         if p_w_q is not None:
             with torch.cuda.stream(speculation_stream):
-                prefetch_idx = speculate_attention(hidden, p_w_q, partial_k_cache, n_head, alpha, max_num_kv)
+                if prefetch_grouped:
+                    prefetch_idx, pad_idx = speculate_attention_grouped(
+                        hidden, p_w_q, partial_k_cache, n_head,
+                        num_key_value_heads, max_num_kv
+                    )
+                else:
+                    prefetch_idx = speculate_attention(
+                        hidden, p_w_q, partial_k_cache, n_head, alpha, max_num_kv
+                    )
 
         # --- Normal Attention ---
         q = F.linear(hidden, w_q)
         k = F.linear(hidden, w_k)
         v = F.linear(hidden, w_v)
 
+        is_mha = (w_k.shape[0] == n_head * head_dim)
+        kv_head = n_head if is_mha else num_key_value_heads
+        rep = n_head // kv_head
+
         q = q.view(b, tgt_s, n_head, head_dim)
-        k = k.view(b, tgt_s, n_head, head_dim)
-        v = v.view(b, tgt_s, num_key_value_heads, head_dim)
+        k = k.view(b, tgt_s, kv_head, head_dim)
+        v = v.view(b, tgt_s, kv_head, head_dim)
 
         q = rms_norm(q, weight=q_ln, eps=eps) * scaling
         k = rms_norm_gqa(k, weight=k_ln, eps=eps)
 
         q = q.transpose(1, 2)  # (b, n_head, 1, d)
-        k = k.transpose(1, 2)  # (b, n_head, 1, d)
+        k = k.transpose(1, 2)  # (b, n_kv, 1, d)
         v = v.transpose(1, 2)  # (b, n_kv, 1, d)
 
         # RoPE
@@ -1329,14 +1398,13 @@ class TorchDevice:
         cos, sin = freqs.cos(), freqs.sin()
         q, k = apply_rotary_pos_emb(q, k, cos, sin, unsqueeze_dim=1)
 
-        # GQA
-        # k_new = repeat_kv(k, num_key_value_groups)  # (b, n_head, 1, d)
-        k_new = k
-        v_new = repeat_kv(v, num_key_value_groups) # only repeat v because of infinigen, shape (b, n_head, 1, d)
+        # GQA: repeat for attention only, keep base for cache
+        k_base = k
+        v_base = v
 
-        # Reshape new k/v for cache update: (1, b * n_head, d)
-        k_cache_new = k_new.permute(1, 0, 2, 3).reshape(tgt_s, b * n_head, head_dim)
-        v_cache_new = v_new.permute(1, 0, 2, 3).reshape(tgt_s, b * n_head, head_dim)
+        # Reshape new k/v for cache update: (1, b * n_kv, d)
+        k_cache_new = k_base.permute(1, 0, 2, 3).reshape(tgt_s, b * kv_head, head_dim)
+        v_cache_new = v_base.permute(1, 0, 2, 3).reshape(tgt_s, b * kv_head, head_dim)
 
         use_sparse = (attn_topk is not None) or (attn_sparsity < 1.0)
 
@@ -1350,29 +1418,23 @@ class TorchDevice:
                     k_all = k_cache.data[:cache_len]
                     v_all = v_cache.data[:cache_len]
 
-                k_all = torch.cat([k_all, k_cache_new], dim=0)  # (cache_len+1, b * n_head, d)
+                k_all = torch.cat([k_all, k_cache_new], dim=0)  # (cache_len+1, b * n_kv, d)
                 v_all = torch.cat([v_all, v_cache_new], dim=0)
 
-                # Reshape for bmm: (b * n_head, d, s), (b * n_head, s, d)
-                k_all = k_all.permute(1, 0, 2)  # (b*n_head, d, cache_len+1)
-                v_all = v_all.permute(1, 0, 2)  # (b*n_head, cache_len+1, d)
-                
-                
-                # q_t = q.transpose(1, 2)  # (b, n_head, 1, d)
-                
+                if rep > 1:
+                    k_all = repeat_kv_cache(k_all, rep, kv_head)
+                    v_all = repeat_kv_cache(v_all, rep, kv_head)
+
+                k_all = k_all.permute(1, 0, 2)  # (b*n_head, cache_len+1, d)
+                v_all = v_all.permute(1, 0, 2)
+
                 k_all = k_all.view(b, n_head, cache_len+1, head_dim)
                 v_all = v_all.view(b, n_head, cache_len+1, head_dim)
 
-
-                # attn_scores = torch.bmm(q_t, k_all) / (head_dim ** 0.5)
-                # attn_probs = F.softmax(attn_scores, dim=-1)
-                # value = torch.bmm(attn_probs, v_all)  # (b*n_head, 1, d)
-                
-                
                 print(f"q shape = {q.shape}", flush=True)
                 print(f"k_all shape = {k_all.shape}", flush=True)
                 print(f"v_all shape = {v_all.shape}", flush=True)
-        
+
                 value = F.scaled_dot_product_attention(
                     q, k_all, v_all,
                     attn_mask=None,
@@ -1407,6 +1469,10 @@ class TorchDevice:
                     v_hist = torch.cat([v_base, v_cache_new], dim=0)
                     local_s = k_hist.shape[0]
                     mask = torch.ones((b, 1, 1, local_s), dtype=torch.bool, device=inputs.device)
+
+                if rep > 1:
+                    k_hist = repeat_kv_cache(k_hist, rep, kv_head)
+                    v_hist = repeat_kv_cache(v_hist, rep, kv_head)
 
                 k_all = k_hist.view(local_s, b, n_head, head_dim).permute(1, 2, 0, 3)  # (b,n_head,local_s,d)
                 v_all = v_hist.view(local_s, b, n_head, head_dim).permute(1, 2, 0, 3)
@@ -1456,6 +1522,10 @@ class TorchDevice:
             k_cache_new = TorchTensor.create_from_torch(k_cache_new, self)
             v_cache_new = TorchTensor.create_from_torch(v_cache_new, self)
 
+        if prefetch_grouped:
+            if prefetch_idx is None:
+                return TorchTensor.create_from_torch(value, self), k_cache_new, v_cache_new, None
+            return TorchTensor.create_from_torch(value, self), k_cache_new, v_cache_new, (prefetch_idx, pad_idx)
         return TorchTensor.create_from_torch(value, self), k_cache_new, v_cache_new, prefetch_idx
     
     ########################################################
@@ -1910,7 +1980,16 @@ class TorchDisk:
         num_key_value_heads, hidden_size, prompt_len, gen_len, gpu_batch_size = (
             config.num_key_value_heads, config.hidden_size, task.prompt_len, task.gen_len,
             policy.gpu_batch_size)
-        shape = (prompt_len + gen_len - 1, gpu_batch_size * num_key_value_heads, config.num_attention_heads)
+        shape = (prompt_len + gen_len - 1, gpu_batch_size * num_key_value_heads, config.head_dim)
+        k_cache = self.allocate(shape, torch.bfloat16)
+        v_cache = self.allocate(shape, torch.bfloat16)
+        return k_cache, v_cache
+
+    def init_cache_one_gpu_batch_infin(self, config, task, policy):
+        num_key_value_heads, prompt_len, gen_len, gpu_batch_size = (
+            getattr(config, "num_key_value_heads", config.num_attention_heads),
+            task.prompt_len, task.gen_len, policy.gpu_batch_size)
+        shape = (prompt_len + gen_len - 1, gpu_batch_size * num_key_value_heads, config.head_dim)
         k_cache = self.allocate(shape, torch.bfloat16)
         v_cache = self.allocate(shape, torch.bfloat16)
         return k_cache, v_cache
@@ -2003,6 +2082,27 @@ class TorchMixedDevice:
             seg_lengths=lens, pin_memory=pin_memory)
         v_cache = self.allocate(shape, torch.bfloat16,
             seg_lengths=lens, pin_memory=pin_memory)
+        return k_cache, v_cache
+
+    def init_cache_one_gpu_batch_infin(self, config, task, policy):
+        num_kv_head, prompt_len, gen_len, gpu_batch_size = (
+            getattr(config, "num_key_value_heads", config.num_attention_heads),
+            task.prompt_len, task.gen_len, policy.gpu_batch_size)
+        shape = (prompt_len + gen_len - 1, gpu_batch_size * num_kv_head, config.head_dim)
+
+        if policy.cache_disk_percent == 0:
+            len_gpu = int(shape[SEG_DIM] * policy.cache_gpu_percent / 100) // num_kv_head * num_kv_head
+            len_cpu = shape[SEG_DIM] - len_gpu
+            len_disk = 0
+        else:
+            len_gpu = int(shape[SEG_DIM] * policy.cache_gpu_percent / 100) // num_kv_head * num_kv_head
+            len_cpu = int(shape[SEG_DIM] * policy.cache_cpu_percent / 100) // num_kv_head * num_kv_head
+            len_disk = shape[SEG_DIM] - len_gpu - len_cpu
+        lens = [len_gpu, len_cpu, len_disk]
+
+        pin_memory = False
+        k_cache = self.allocate(shape, torch.bfloat16, seg_lengths=lens, pin_memory=pin_memory)
+        v_cache = self.allocate(shape, torch.bfloat16, seg_lengths=lens, pin_memory=pin_memory)
         return k_cache, v_cache
 
 

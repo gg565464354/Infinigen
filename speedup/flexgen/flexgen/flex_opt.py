@@ -968,21 +968,46 @@ def run_flexgen(args):
             hidden_size=head_dim
         )
 
+    use_profile = True  # toggle for torch.profiler runs
     try:
-        print("warmup - generate")
-        _ = model.generate(warmup_inputs, max_new_tokens=1, verbose=args.verbose, warmup=True)
+        if use_profile:
+            from torch.profiler import profile, ProfilerActivity
+            activities = [ProfilerActivity.CPU, ProfilerActivity.CUDA]
 
-        print("benchmark - generate")
-        timers("generate").reset()
-        output_ids = model.generate(
-            inputs,
-            max_new_tokens=args.gen_len,
-            debug_mode=args.debug_mode,
-            cut_gen_len=args.cut_gen_len,
-            verbose=args.verbose,
-            warmup=False
-        )
-        costs = timers("generate").costs
+            print("warmup - generate")
+            _ = model.generate(warmup_inputs, max_new_tokens=1, verbose=args.verbose, warmup=True)
+            torch.cuda.synchronize()
+
+            print("benchmark - generate")
+            timers("generate").reset()
+            with profile(activities=activities, with_stack=True) as prof:
+                output_ids = model.generate(
+                    inputs,
+                    max_new_tokens=args.gen_len,
+                    debug_mode=args.debug_mode,
+                    cut_gen_len=args.cut_gen_len,
+                    verbose=args.verbose,
+                    warmup=False
+                )
+            prof.export_chrome_trace(
+                f"/root/sparse-load/SparseCache/speedup/profile_mycache_gpu_b{args.gpu_batch_size}_i{args.prompt_len}_o{args.gen_len}.json"
+            )
+            costs = timers("generate").costs
+        else:
+            print("warmup - generate")
+            _ = model.generate(warmup_inputs, max_new_tokens=1, verbose=args.verbose, warmup=True)
+
+            print("benchmark - generate")
+            timers("generate").reset()
+            output_ids = model.generate(
+                inputs,
+                max_new_tokens=args.gen_len,
+                debug_mode=args.debug_mode,
+                cut_gen_len=args.cut_gen_len,
+                verbose=args.verbose,
+                warmup=False
+            )
+            costs = timers("generate").costs
     finally:
         env.close_copy_threads()
 

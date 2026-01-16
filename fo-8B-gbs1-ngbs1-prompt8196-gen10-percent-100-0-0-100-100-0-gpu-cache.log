@@ -1,0 +1,40 @@
+model size: 0.000 GB	cache size: 0.000 GB	hidden size (p): 0.000 GB
+peak gpu mem: 21.267 GB	projected: False
+prefill latency: 2.731 s	prefill throughput: 3001.086 token/s
+decode latency: 1.828 s	decode throughput: 4.924 token/s
+total latency: 4.559 s	total throughput: 2.194 token/s
+model size: 0.000 GB	cache size: 0.000 GB	hidden size (p): 0.000 GB
+peak gpu mem: 21.267 GB	projected: False
+prefill latency: 2.732 s	prefill throughput: 3000.321 token/s
+decode latency: 2.247 s	decode throughput: 4.005 token/s
+total latency: 4.979 s	total throughput: 2.008 token/s
+model size: 0.000 GB	cache size: 0.000 GB	hidden size (p): 0.000 GB
+peak gpu mem: 21.267 GB	projected: False
+prefill latency: 2.832 s	prefill throughput: 2894.194 token/s
+decode latency: 2.457 s	decode throughput: 3.663 token/s
+total latency: 5.289 s	total throughput: 1.891 token/s
+model size: 0.000 GB	cache size: 0.000 GB	hidden size (p): 0.000 GB
+peak gpu mem: 21.267 GB	projected: False
+prefill latency: 2.621 s	prefill throughput: 3127.569 token/s
+decode latency: 1.244 s	decode throughput: 7.233 token/s
+total latency: 3.865 s	total throughput: 2.587 token/s
+model size: 0.000 GB	cache size: 0.000 GB	hidden size (p): 0.000 GB
+peak gpu mem: 21.267 GB	projected: False
+prefill latency: 2.624 s	prefill throughput: 3123.258 token/s
+decode latency: 2.329 s	decode throughput: 3.864 token/s
+total latency: 4.953 s	total throughput: 2.019 token/s
+model size: 0.000 GB	cache size: 0.000 GB	hidden size (p): 0.000 GB
+peak gpu mem: 21.267 GB	projected: False
+prefill latency: 2.794 s	prefill throughput: 2933.886 token/s
+decode latency: 1.168 s	decode throughput: 7.705 token/s
+total latency: 3.962 s	total throughput: 2.524 token/s
+model size: 0.000 GB	cache size: 0.000 GB	hidden size (p): 0.000 GB
+peak gpu mem: 21.267 GB	projected: False
+prefill latency: 2.564 s	prefill throughput: 3196.355 token/s
+decode latency: 2.074 s	decode throughput: 4.339 token/s
+total latency: 4.638 s	total throughput: 2.156 token/s
+model size: 0.000 GB	cache size: 0.000 GB	hidden size (p): 0.000 GB
+peak gpu mem: 21.267 GB	projected: False
+prefill latency: 2.443 s	prefill throughput: 3354.718 token/s
+decode latency: 1.398 s	decode throughput: 6.437 token/s
+total latency: 3.841 s	total throughput: 2.603 token/s

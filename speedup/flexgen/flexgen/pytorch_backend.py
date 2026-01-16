@@ -18,7 +18,6 @@ from infinigen.skewing_controller import reform_hidden_states, skew, skew_gqa
 from infinigen.partial_weight_generation_controller import partial_weight_index_generation
 from infinigen.kv_selection_controller import speculate_attention
 
-
 # from transformers.models.qwen3.modeling_qwen3 import apply_rotary_pos_emb
 
 from flexgen.utils import (GB, T, cpu_mem_stats, vector_gather,
@@ -1249,6 +1248,8 @@ class TorchDevice:
         q = F.linear(hidden, w_q)  # (b, s, h)
         k = F.linear(hidden, w_k)
         v = F.linear(hidden, w_v)
+
+        print(f"[backend debug] w_k shape = {w_k.shape}, w_v shape = {w_v.shape}", flush=True)
         
         # judge the k cache size
         is_mha = False
@@ -1290,7 +1291,9 @@ class TorchDevice:
 
         # Skew mechanism during warmup
         if warmup:
+            print(f"[backend debug] skew_gqa before w_q shape = {w_q.shape}, w_k shape = {w_k.shape}")
             w_q.data, w_k.data = skew_gqa(q, k, w_q, w_k, n_head, num_key_value_heads, head_dim)
+            print(f"[backend debug] skew_gqa after w_q shape = {w_q.shape}, w_k shape = {w_k.shape}")
         
 
         # Causal mask
