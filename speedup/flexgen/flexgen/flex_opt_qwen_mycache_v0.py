@@ -21,6 +21,7 @@ from tqdm import tqdm
 import torch
 import torch.nn.functional as F
 from transformers import AutoTokenizer, Qwen3Config
+from torch.profiler import profile, record_function, ProfilerActivity
 
 from flexgen.compression import CompressionConfig
 from flexgen.opt_config import OptConfig, get_opt_config
@@ -980,6 +981,39 @@ def run_flexgen(args):
             sparse_len=args.max_num_kv,
             hidden_size=head_dim
         )
+
+    ##################### profile
+#     activities = [ProfilerActivity.CPU, ProfilerActivity.CUDA]
+
+#     try:
+#         print("warmup - generate")
+#         _ = model.generate(warmup_inputs, max_new_tokens=1, verbose=args.verbose, warmup=True)
+#         torch.cuda.synchronize()
+
+#         print("benchmark - generate")
+#         timers("generate").reset()
+
+#         with profile(activities=activities, with_stack=True) as prof:
+#             output_ids = model.generate(
+#                 inputs,
+#                 max_new_tokens=args.gen_len,
+#                 debug_mode=args.debug_mode,
+#                 cut_gen_len=args.cut_gen_len,
+#                 verbose=args.verbose,
+#                 warmup=False
+#             )
+
+#         # 保存 profile
+#         prof.export_chrome_trace(
+#             f"/root/sparse-load/SparseCache/speedup/profile_mycache_gpu_b{args.gpu_batch_size}_i{args.prompt_len}_o{args.gen_len}.json"
+#         )
+#         # prof.export_chrome_trace(f"/NVME1/projects/qin/InfiniGen-main/speedup/profile_mycache_b{args.gpu_batch_size}_i{args.prompt_len}_o{args.gen_len}.json")
+
+#         costs = timers("generate").costs
+#     finally:
+#         env.close_copy_threads()
+
+    ##################### profile
 
     try:
         print("warmup - generate")

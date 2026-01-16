@@ -42,7 +42,14 @@
                 "--partial-weight-ratio",
                 "0.2",
                 "--max-num-kv",
-                "2048"
+                "2048",
+                "--gpu-cache-num",
+                 "1",
+                "--gpu-cache-pred",
+                "2",
+                "--cpu-cache-pred",
+                "1.5"
+ 1.5 \
             ]
         }
     ]

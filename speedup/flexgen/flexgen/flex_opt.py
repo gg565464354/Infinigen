@@ -336,10 +336,10 @@ class SelfAttention:
                 k_data = k_home.data
                 v_data = v_home.data
                 cache_dtype = k_home.dtype
-                if isinstance(k_data, torch.Tensor) and k_data.dtype == torch.bfloat16:
-                    k_data = k_data.to(torch.float16)
-                    v_data = v_data.to(torch.float16)
-                    cache_dtype = torch.float16
+                # if isinstance(k_data, torch.Tensor) and k_data.dtype == torch.bfloat16:
+                #     k_data = k_data.to(torch.float16)
+                #     v_data = v_data.to(torch.float16)
+                #     cache_dtype = config.torch_dtype
 
                 group_gpu_k, group_gpu_v, group_unhit = self._cache_manager.unified_load_api(
                     self.layer_id, prefetch_cache_stream, prefetch_idx_int, pad_idx_int,
@@ -515,7 +515,10 @@ class OptLM:
         policy: Policy,
         partial_weight_ratio=0.2,
         alpha=4,
-        max_num_kv=400
+        max_num_kv=400,
+        gpu_cache_num: int = 0,
+        gpu_cache_thres: int = 0,
+        cpu_cache_thres: int = 0,
     ):
         if isinstance(config, str):
             config = get_opt_config(config)
@@ -528,7 +531,7 @@ class OptLM:
 
         self.head_num = getattr(self.config, "num_key_value_heads", self.config.num_attention_heads)
         self.head_dim = getattr(self.config, "head_dim", self.config.hidden_size // self.config.num_attention_heads)
-        cache_dtype = torch.float16
+        cache_dtype = config.torch_dtype
 
         original_head_group_ids = {}
         for l in range(self.config.num_hidden_layers):
@@ -542,8 +545,9 @@ class OptLM:
             max_sparse_len=max_num_kv,
             head_dim=self.head_dim,
             dtype=cache_dtype,
-            gpu_cache_pred=2,
-            cpu_cache_pred=2
+            gpu_cache_num=gpu_cache_num,
+            gpu_cache_thres=gpu_cache_thres,
+            cpu_cache_thres=cpu_cache_thres,
         )
 
         # ---- load state_dict from safetensors ----
@@ -594,7 +598,7 @@ class OptLM:
 
         # ---- buffers ----
         L = self.num_layers
-        B = self.policy.num_gpu_batches
+        B = self.num_gpu_batches
         self.cache_home = array_2d(L, B, ValueHolder)
         self.cache_read_buf = array_2d(L, B, ValueHolder)
         self.cache_write_buf = array_2d(L, B, ValueHolder)
@@ -953,7 +957,10 @@ def run_flexgen(args):
         qwen_config, env, args.path, policy,
         partial_weight_ratio=args.partial_weight_ratio,
         alpha=args.alpha,
-        max_num_kv=args.max_num_kv
+        max_num_kv=args.max_num_kv,
+        gpu_cache_num=int(getattr(args, "gpu_cache_num", 0) or 0),
+        gpu_cache_thres=int(getattr(args, "gpu_cache_pred", 0) or 0),
+        cpu_cache_thres=int(getattr(args, "cpu_cache_pred", 0) or 0),
     )
 
     head_dim = getattr(qwen_config, "head_dim",
@@ -965,7 +972,7 @@ def run_flexgen(args):
             batch_size=num_prompts,
             head_num=getattr(qwen_config, "num_key_value_heads", qwen_config.num_attention_heads),
             sparse_len=args.max_num_kv,
-            hidden_size=head_dim
+            hidden_size=head_dim,
         )
 
     use_profile = True  # toggle for torch.profiler runs
@@ -990,7 +997,7 @@ def run_flexgen(args):
                     warmup=False
                 )
             prof.export_chrome_trace(
-                f"/root/sparse-load/SparseCache/speedup/profile_mycache_gpu_b{args.gpu_batch_size}_i{args.prompt_len}_o{args.gen_len}.json"
+                f"/root/InfiniGen/speedup/profile_mycache_gpu_b{args.gpu_batch_size}_i{args.prompt_len}_o{args.gen_len}.json"
             )
             costs = timers("generate").costs
         else:
@@ -1081,6 +1088,16 @@ def add_parser_arguments(parser):
     parser.add_argument("--partial-weight-ratio", type=float, default=0.2)
     parser.add_argument("--max-num-kv", type=int, default=400)
 
+    # cache manager knobs (for my_cache_bench.sh)
+    # gpu-cache-num: GPU cache 数量/容量开关（0=禁用 GPU cache）
+    parser.add_argument("--gpu-cache-num", type=int, default=0,
+                        help="GPU cache capacity/num. 0 disables GPU cache.")
+    # 兼容原脚本参数名：这里实际语义为阈值（最大 token 长度）
+    parser.add_argument("--gpu-cache-pred", type=int, default=0,
+                        help="GPU cache max threshold (token length). 0 uses max-num-kv.")
+    parser.add_argument("--cpu-cache-pred", type=int, default=0,
+                        help="CPU cache max threshold (token length). 0 uses max-num-kv.")
+
     parser.add_argument("--warmup-input-path", type=str, required=True)
     parser.add_argument("--test-input-path", type=str, required=True)
 
@@ -1090,4 +1107,5 @@ if __name__ == "__main__":
     add_parser_arguments(parser)
     args = parser.parse_args()
     assert len(args.percent) == 6
+
     run_flexgen(args)

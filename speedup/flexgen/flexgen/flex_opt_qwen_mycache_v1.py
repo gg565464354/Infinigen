@@ -336,10 +336,10 @@ class SelfAttention:
                 k_data = k_home.data
                 v_data = v_home.data
                 cache_dtype = k_home.dtype
-                if isinstance(k_data, torch.Tensor) and k_data.dtype == torch.bfloat16:
-                    k_data = k_data.to(torch.float16)
-                    v_data = v_data.to(torch.float16)
-                    cache_dtype = config.torch_dtype
+                # if isinstance(k_data, torch.Tensor) and k_data.dtype == torch.bfloat16:
+                #     k_data = k_data.to(torch.float16)
+                #     v_data = v_data.to(torch.float16)
+                #     cache_dtype = config.torch_dtype
 
                 group_gpu_k, group_gpu_v, group_unhit = self._cache_manager.unified_load_api(
                     self.layer_id, prefetch_cache_stream, prefetch_idx_int, pad_idx_int,
@@ -526,37 +526,9 @@ class OptLM:
         self.policy = policy
         self.num_gpu_batches = policy.num_gpu_batches
 
-        # ---- load state_dict from safetensors ----
-        print(f"Loading model from safetensors in: {path}")
-        safetensor_files = sorted([f for f in os.listdir(path) if f.endswith(".safetensors")])
-        if not safetensor_files:
-            raise FileNotFoundError(f"No .safetensors files found in {path}")
-
-        state_dict = {}
-        for f in safetensor_files:
-            file_path = os.path.join(path, f)
-            print(f"Loading {file_path}...")
-            tensors = load_file(file_path, device="cpu")
-            state_dict.update(tensors)
-        print(f"Loaded {len(state_dict)} tensors.")
-        self.model_state_dict = state_dict
-
-        q_proj = self.model_state_dict.get("model.layers.0.self_attn.q_proj.weight")
-        k_proj = self.model_state_dict.get("model.layers.0.self_attn.k_proj.weight")
-        if q_proj is not None:
-            hidden_size = q_proj.shape[0]
-            head_dim = hidden_size // self.config.num_attention_heads
-            self.config.hidden_size = hidden_size
-            if hasattr(self.config, "head_dim"):
-                self.config.head_dim = head_dim
-            if k_proj is not None:
-                kv_head = k_proj.shape[0] // head_dim
-                if hasattr(self.config, "num_key_value_heads"):
-                    self.config.num_key_value_heads = kv_head
-
         self.head_num = getattr(self.config, "num_key_value_heads", self.config.num_attention_heads)
         self.head_dim = getattr(self.config, "head_dim", self.config.hidden_size // self.config.num_attention_heads)
-        cache_dtype = torch.float16
+        cache_dtype = config.torch_dtype
 
         original_head_group_ids = {}
         for l in range(self.config.num_hidden_layers):
@@ -573,6 +545,21 @@ class OptLM:
             gpu_cache_pred=2,
             cpu_cache_pred=2
         )
+
+        # ---- load state_dict from safetensors ----
+        print(f"Loading model from safetensors in: {path}")
+        safetensor_files = sorted([f for f in os.listdir(path) if f.endswith(".safetensors")])
+        if not safetensor_files:
+            raise FileNotFoundError(f"No .safetensors files found in {path}")
+
+        state_dict = {}
+        for f in safetensor_files:
+            file_path = os.path.join(path, f)
+            print(f"Loading {file_path}...")
+            tensors = load_file(file_path, device="cpu")
+            state_dict.update(tensors)
+        print(f"Loaded {len(state_dict)} tensors.")
+        self.model_state_dict = state_dict
 
         # ---- build layers ----
         self.layers = []
@@ -969,33 +956,58 @@ def run_flexgen(args):
         max_num_kv=args.max_num_kv
     )
 
-    head_dim = model.head_dim
-    head_num = model.head_num
-    for l in range(model.config.num_hidden_layers):
+    head_dim = getattr(qwen_config, "head_dim",
+                       qwen_config.hidden_size // qwen_config.num_attention_heads)
+    for l in range(qwen_config.num_hidden_layers):
         model._cache_manager.add_cache(
             device="cuda:0",
             layer_id=l,
             batch_size=num_prompts,
-            head_num=head_num,
+            head_num=getattr(qwen_config, "num_key_value_heads", qwen_config.num_attention_heads),
             sparse_len=args.max_num_kv,
-            hidden_size=head_dim
+            hidden_size=head_dim,
         )
 
+    use_profile = False  # toggle for torch.profiler runs
     try:
-        print("warmup - generate")
-        _ = model.generate(warmup_inputs, max_new_tokens=1, verbose=args.verbose, warmup=True)
+        if use_profile:
+            from torch.profiler import profile, ProfilerActivity
+            activities = [ProfilerActivity.CPU, ProfilerActivity.CUDA]
 
-        print("benchmark - generate")
-        timers("generate").reset()
-        output_ids = model.generate(
-            inputs,
-            max_new_tokens=args.gen_len,
-            debug_mode=args.debug_mode,
-            cut_gen_len=args.cut_gen_len,
-            verbose=args.verbose,
-            warmup=False
-        )
-        costs = timers("generate").costs
+            print("warmup - generate")
+            _ = model.generate(warmup_inputs, max_new_tokens=1, verbose=args.verbose, warmup=True)
+            torch.cuda.synchronize()
+
+            print("benchmark - generate")
+            timers("generate").reset()
+            with profile(activities=activities, with_stack=True) as prof:
+                output_ids = model.generate(
+                    inputs,
+                    max_new_tokens=args.gen_len,
+                    debug_mode=args.debug_mode,
+                    cut_gen_len=args.cut_gen_len,
+                    verbose=args.verbose,
+                    warmup=False
+                )
+            prof.export_chrome_trace(
+                f"/root/InfiniGen/speedup/profile_mycache_gpu_b{args.gpu_batch_size}_i{args.prompt_len}_o{args.gen_len}.json"
+            )
+            costs = timers("generate").costs
+        else:
+            print("warmup - generate")
+            _ = model.generate(warmup_inputs, max_new_tokens=1, verbose=args.verbose, warmup=True)
+
+            print("benchmark - generate")
+            timers("generate").reset()
+            output_ids = model.generate(
+                inputs,
+                max_new_tokens=args.gen_len,
+                debug_mode=args.debug_mode,
+                cut_gen_len=args.cut_gen_len,
+                verbose=args.verbose,
+                warmup=False
+            )
+            costs = timers("generate").costs
     finally:
         env.close_copy_threads()
 

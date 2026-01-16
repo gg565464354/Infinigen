@@ -1,0 +1,23 @@
+===== Running with --prompt-len 8196 --max-num-kv 2048 --gpu-batch-size 1 =====
+/root/miniconda3/envs/infinigen/lib/python3.11/site-packages/torch/cuda/__init__.py:63: FutureWarning: The pynvml package is deprecated. Please install nvidia-ml-py instead. If you did not install pynvml directly, please report this to the maintainers of the package that installed pynvml for you.
+  import pynvml  # type: ignore[import]
+usage: flex_opt.py [-h] [--model MODEL] [--path PATH]
+                   [--offload-dir OFFLOAD_DIR] [--prompt-len PROMPT_LEN]
+                   [--gen-len GEN_LEN] [--cut-gen-len CUT_GEN_LEN]
+                   [--debug-mode {fewer_batch,breakdown}]
+                   [--gpu-batch-size GPU_BATCH_SIZE]
+                   [--num-gpu-batches NUM_GPU_BATCHES]
+                   [--percent PERCENT [PERCENT ...]] [--sep-layer [SEP_LAYER]]
+                   [--pin-weight [PIN_WEIGHT]] [--cpu-cache-compute]
+                   [--attn-sparsity ATTN_SPARSITY] [--compress-weight]
+                   [--compress-cache] [--log-file LOG_FILE]
+                   [--verbose VERBOSE] [--overlap [OVERLAP]] [--alpha ALPHA]
+                   [--partial-weight-ratio PARTIAL_WEIGHT_RATIO]
+                   [--max-num-kv MAX_NUM_KV] [--gpu-cache-num GPU_CACHE_NUM]
+                   [--gpu-cache-pred GPU_CACHE_PRED]
+                   [--cpu-cache-pred CPU_CACHE_PRED] --warmup-input-path
+                   WARMUP_INPUT_PATH --test-input-path TEST_INPUT_PATH
+flex_opt.py: error: argument --cpu-cache-pred: invalid int value: '1.5'
+
+
+
