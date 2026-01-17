@@ -515,7 +515,10 @@ class OptLM:
         policy: Policy,
         partial_weight_ratio=0.2,
         alpha=4,
-        max_num_kv=400
+        max_num_kv=400,
+        gpu_cache_num: int = 0,
+        gpu_cache_pred: float = 1.0,
+        cpu_cache_pred: float = 1.0,
     ):
         if isinstance(config, str):
             config = get_opt_config(config)
@@ -525,6 +528,9 @@ class OptLM:
         self.path = path
         self.policy = policy
         self.num_gpu_batches = policy.num_gpu_batches
+        self.gpu_cache_num = int(gpu_cache_num)
+        self.gpu_cache_pred = float(gpu_cache_pred)
+        self.cpu_cache_pred = float(cpu_cache_pred)
 
         self.head_num = getattr(self.config, "num_key_value_heads", self.config.num_attention_heads)
         self.head_dim = getattr(self.config, "head_dim", self.config.hidden_size // self.config.num_attention_heads)
@@ -533,6 +539,11 @@ class OptLM:
         original_head_group_ids = {}
         for l in range(self.config.num_hidden_layers):
             original_head_group_ids[l] = [list(range(self.head_num))]
+        import math
+        gpu_pool_sparse_len = int(math.ceil(max_num_kv * self.gpu_cache_pred))
+        cpu_pool_sparse_len = int(math.ceil(max_num_kv * self.cpu_cache_pred))
+        gpu_pool_sparse_len = max(gpu_pool_sparse_len, 1)
+        cpu_pool_sparse_len = max(cpu_pool_sparse_len, 1)
 
         self._cache_manager = CacheManager(
             basic_group_head_ids=original_head_group_ids,
@@ -542,8 +553,8 @@ class OptLM:
             max_sparse_len=max_num_kv,
             head_dim=self.head_dim,
             dtype=cache_dtype,
-            gpu_cache_pred=2,
-            cpu_cache_pred=2
+            gpu_cache_pred=gpu_pool_sparse_len,
+            cpu_cache_pred=cpu_pool_sparse_len,
         )
 
         # ---- load state_dict from safetensors ----
@@ -953,11 +964,15 @@ def run_flexgen(args):
         qwen_config, env, args.path, policy,
         partial_weight_ratio=args.partial_weight_ratio,
         alpha=args.alpha,
-        max_num_kv=args.max_num_kv
+        max_num_kv=args.max_num_kv,
+        gpu_cache_num=args.gpu_cache_num,
+        gpu_cache_pred=args.gpu_cache_pred,
+        cpu_cache_pred=args.cpu_cache_pred,
     )
 
     head_dim = getattr(qwen_config, "head_dim",
                        qwen_config.hidden_size // qwen_config.num_attention_heads)
+    cache_device = "cpu" if args.gpu_cache_num == 0 else "cuda:0"
     for l in range(qwen_config.num_hidden_layers):
         model._cache_manager.add_cache(
             device="cuda:0",
@@ -1080,6 +1095,13 @@ def add_parser_arguments(parser):
     parser.add_argument("--alpha", type=int, default=4)
     parser.add_argument("--partial-weight-ratio", type=float, default=0.2)
     parser.add_argument("--max-num-kv", type=int, default=400)
+    parser.add_argument("--gpu-cache-num", type=int, default=0,
+                        help="GPU cache pool 的数量/分片数；为 0 时使用 CPU cache pool")
+    parser.add_argument("--gpu-cache-pred", type=float, default=1.0,
+                        help="GPU cache 容量倍率，相对于 max-num-kv")
+    parser.add_argument("--cpu-cache-pred", type=float, default=1.0,
+                        help="CPU cache 容量倍率，相对于 max-num-kv")
+ 
 
     parser.add_argument("--warmup-input-path", type=str, required=True)
     parser.add_argument("--test-input-path", type=str, required=True)
