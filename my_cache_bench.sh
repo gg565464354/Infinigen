@@ -8,7 +8,7 @@ batch_sizes=1
 # batch_sizes=(8)
 prompt_len=8196
 max_kv=2048
-gen_len=10
+gen_len=512
 
 # gpu_cache_num=30
 gpu_cache_num=0
@@ -38,7 +38,7 @@ for batch_size in "${batch_sizes[@]}"; do
         --alpha 4 \
         --partial-weight-ratio 0.2 \
         --max-num-kv "$max_kv" \
-        --gpu-cache-num 0 \
+        --gpu-cache-num 1 \
         --gpu-cache-pred 2 \
         --cpu-cache-pred 1.5 \
         2>&1 | tee -a "$LOG_FILE"
