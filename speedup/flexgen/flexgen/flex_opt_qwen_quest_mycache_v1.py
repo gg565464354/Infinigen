@@ -40,60 +40,7 @@ from infinigen.partial_weight_generation_controller import (
     set_partial_cache_gqa, set_partial_weight
 )
 from flexgen.cache_selection_controller_v2 import CacheManager, reconstruct_unhit_only_on_gpu
-import sys
-
-
-def _import_quest_sparse_page_selector():
-    """
-    quest 仓库在一些环境里可能没打包成标准 Python package（例如缺 `quest/__init__.py`），
-    导致 `import quest` 失败；但只要把源码根目录加入 sys.path，就能用 namespace package 导入。
-    """
-    try:
-        from quest.quest_sparse import QuestSparsePageSelector  # type: ignore
-        return QuestSparsePageSelector
-    except ModuleNotFoundError:
-        pass
-
-    import os
-
-    candidate_roots = [
-        os.environ.get("QUEST_PATH"),
-        "/root/sparse-load/SparseCache/speedup/quest",
-        "/root/cnb_sparse-load/SparseCache/speedup/quest",
-    ]
-    for root in candidate_roots:
-        if not root:
-            continue
-        if os.path.isdir(root) and (root not in sys.path):
-            sys.path.insert(0, root)
-            try:
-                from quest.quest_sparse import QuestSparsePageSelector  # type: ignore
-                return QuestSparsePageSelector
-            except ModuleNotFoundError:
-                continue
-
-    try:
-        from quest_sparse import QuestSparsePageSelector  # type: ignore
-        return QuestSparsePageSelector
-    except ModuleNotFoundError as e:
-        raise ModuleNotFoundError(
-            "无法导入 quest（QuestSparsePageSelector）。\n"
-            "解决：\n"
-            "  - `export QUEST_PATH=/root/sparse-load/SparseCache/speedup/quest`\n"
-            "    或 `export PYTHONPATH=/root/sparse-load/SparseCache/speedup/quest:$PYTHONPATH`\n"
-            "  - 或在 quest 源码目录补一个 `quest/__init__.py` 后重新 `pip install -e`"
-        ) from e
-
-
-def _get_model_torch_dtype(config) -> torch.dtype:
-    dtype = getattr(config, "dtype", None)
-    if dtype is None:
-        dtype = getattr(config, "torch_dtype", None)
-    if dtype is None:
-        return torch.bfloat16
-    if isinstance(dtype, str):
-        return getattr(torch, dtype, torch.bfloat16)
-    return dtype
+from quest.quest_sparse import QuestSparsePageSelector
 
 from safetensors.torch import load_file
 
@@ -160,7 +107,7 @@ class InputEmbed:
         if state_dict is None:
             raise ValueError("state_dict required")
         device = self.env.gpu.dev
-        dtype = _get_model_torch_dtype(self.config)
+        dtype = self.config.torch_dtype
         embed_tokens_weight = state_dict["model.embed_tokens.weight"].to(device, dtype)
         weight_home.val = {"embed_tokens_weight": embed_tokens_weight}
 
@@ -188,7 +135,7 @@ class OutputEmbed:
         if state_dict is None:
             raise ValueError("state_dict required")
         device = self.env.gpu.dev
-        dtype = _get_model_torch_dtype(self.config)
+        dtype = self.config.torch_dtype
         if "lm_head.weight" in state_dict:
             lm_head_weight = state_dict["lm_head.weight"]
         else:
@@ -226,7 +173,7 @@ class MLP:
         if state_dict is None:
             raise ValueError("state_dict required")
         device = self.env.gpu.dev
-        dtype = _get_model_torch_dtype(self.config)
+        dtype = self.config.torch_dtype
         prefix = f"model.layers.{layer_id}.mlp."
         norm_prefix = f"model.layers.{layer_id}.post_attention_layernorm."
         weight_home.val = {
@@ -309,7 +256,6 @@ class SelfAttention:
         self.unhit_id_map = None
 
         if self.prefetch_algo == "quest" and self.enable_prefetching:
-            QuestSparsePageSelector = _import_quest_sparse_page_selector()
             max_seq_len = task.prompt_len + task.gen_len
             self.quest_selector = QuestSparsePageSelector(
                 batch_size=self.policy.gpu_batch_size,
@@ -317,7 +263,7 @@ class SelfAttention:
                 num_heads=self.num_key_value_heads,
                 head_dim=self.head_dim,
                 page_size=self.quest_page_size,
-                dtype=getattr(self._cache_manager, "dtype", _get_model_torch_dtype(self.config)),
+                dtype=self.config.torch_dtype,
                 device=str(self.compute.dev),
             )
         else:
@@ -327,7 +273,7 @@ class SelfAttention:
         if state_dict is None:
             raise ValueError("state_dict required")
         device = self.env.gpu.dev
-        dtype = _get_model_torch_dtype(self.config)
+        dtype = self.config.torch_dtype
         prefix = f"model.layers.{layer_id}."
         weight_home.val = {
             "q_proj_weight": state_dict[prefix + "self_attn.q_proj.weight"].to(device, dtype),
@@ -581,7 +527,11 @@ class SelfAttention:
             k_cache_buf = TorchTensor.create_from_torch(k_cache_buf, self.compute)
             v_cache_buf = TorchTensor.create_from_torch(v_cache_buf, self.compute)
 
-        # NOTE: keep cache dtype as-is (often fp16). Backend will cast q/k/v cheaply if needed.
+        # Avoid redundant dtype cast
+        target_dtype = self.config.torch_dtype
+        if k_cache_buf.data.dtype != target_dtype:
+            k_cache_buf.data = k_cache_buf.data.to(target_dtype)
+            v_cache_buf.data = v_cache_buf.data.to(target_dtype)
 
         if self.enable_prefetching:
             if self.prefetch_algo == "quest":
@@ -684,8 +634,7 @@ class OptLM:
 
         self.head_num = getattr(self.config, "num_key_value_heads", self.config.num_attention_heads)
         self.head_dim = getattr(self.config, "head_dim", self.config.hidden_size // self.config.num_attention_heads)
-        model_dtype = _get_model_torch_dtype(config)
-        cache_dtype = torch.float16 if model_dtype == torch.bfloat16 else model_dtype
+        cache_dtype = config.torch_dtype
 
         original_head_group_ids = {}
         for l in range(self.config.num_hidden_layers):
