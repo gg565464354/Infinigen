@@ -21,7 +21,6 @@ from tqdm import tqdm
 import torch
 import torch.nn.functional as F
 from transformers import AutoTokenizer, Qwen3Config
-from torch.profiler import profile, record_function, ProfilerActivity
 
 from flexgen.compression import CompressionConfig
 from flexgen.opt_config import OptConfig, get_opt_config
@@ -337,11 +336,12 @@ class SelfAttention:
                 k_data = k_home.data
                 v_data = v_home.data
                 cache_dtype = k_home.dtype
-                if isinstance(k_data, torch.Tensor) and k_data.dtype == torch.bfloat16:
-                    k_data = k_data.to(torch.float16)
-                    v_data = v_data.to(torch.float16)
-                    cache_dtype = torch.float16
-
+                # if isinstance(k_data, torch.Tensor) and k_data.dtype == torch.bfloat16:
+                #     k_data = k_data.to(torch.float16)
+                #     v_data = v_data.to(torch.float16)
+                #     cache_dtype = config.torch_dtype
+                if not self._cache_manager._require_update.get(self.layer_id, False):
+                    prefetch_idx_int = self._cache_manager.cache_miss_check(self.layer_id, prefetch_idx_int)
                 group_gpu_k, group_gpu_v, group_unhit = self._cache_manager.unified_load_api(
                     self.layer_id, prefetch_cache_stream, prefetch_idx_int, pad_idx_int,
                     k_data, v_data, cache_dtype
@@ -516,7 +516,10 @@ class OptLM:
         policy: Policy,
         partial_weight_ratio=0.2,
         alpha=4,
-        max_num_kv=400
+        max_num_kv=400,
+        gpu_cache_num: int = 0,
+        gpu_cache_pred: float = 1.0,
+        cpu_cache_pred: float = 1.0,
     ):
         if isinstance(config, str):
             config = get_opt_config(config)
@@ -526,6 +529,28 @@ class OptLM:
         self.path = path
         self.policy = policy
         self.num_gpu_batches = policy.num_gpu_batches
+        self.gpu_cache_num = int(gpu_cache_num)
+        self.gpu_cache_pred = float(gpu_cache_pred)
+        self.cpu_cache_pred = float(cpu_cache_pred)
+
+        self.head_num = getattr(self.config, "num_key_value_heads", self.config.num_attention_heads)
+        self.head_dim = getattr(self.config, "head_dim", self.config.hidden_size // self.config.num_attention_heads)
+        cache_dtype = config.torch_dtype
+
+        original_head_group_ids = {}
+        for l in range(self.config.num_hidden_layers):
+            original_head_group_ids[l] = [list(range(self.head_num))]
+        self._cache_manager = CacheManager(
+            basic_group_head_ids=original_head_group_ids,
+            layer_head_num=self.head_num,
+            batch_size=self.policy.gpu_batch_size,
+            head_num=self.head_num,
+            max_sparse_len=max_num_kv,
+            head_dim=self.head_dim,
+            dtype=cache_dtype,
+            gpu_cache_pred=self.gpu_cache_pred,
+            cpu_cache_pred=self.cpu_cache_pred,
+        )
 
         # ---- load state_dict from safetensors ----
         print(f"Loading model from safetensors in: {path}")
@@ -541,39 +566,6 @@ class OptLM:
             state_dict.update(tensors)
         print(f"Loaded {len(state_dict)} tensors.")
         self.model_state_dict = state_dict
-
-        q_proj = self.model_state_dict.get("model.layers.0.self_attn.q_proj.weight")
-        k_proj = self.model_state_dict.get("model.layers.0.self_attn.k_proj.weight")
-        if q_proj is not None:
-            hidden_size = q_proj.shape[0]
-            head_dim = hidden_size // self.config.num_attention_heads
-            self.config.hidden_size = hidden_size
-            if hasattr(self.config, "head_dim"):
-                self.config.head_dim = head_dim
-            if k_proj is not None:
-                kv_head = k_proj.shape[0] // head_dim
-                if hasattr(self.config, "num_key_value_heads"):
-                    self.config.num_key_value_heads = kv_head
-
-        self.head_num = getattr(self.config, "num_key_value_heads", self.config.num_attention_heads)
-        self.head_dim = getattr(self.config, "head_dim", self.config.hidden_size // self.config.num_attention_heads)
-        cache_dtype = torch.float16
-
-        original_head_group_ids = {}
-        for l in range(self.config.num_hidden_layers):
-            original_head_group_ids[l] = [list(range(self.head_num))]
-
-        self._cache_manager = CacheManager(
-            basic_group_head_ids=original_head_group_ids,
-            layer_head_num=self.head_num,
-            batch_size=self.policy.gpu_batch_size,
-            head_num=self.head_num,
-            max_sparse_len=max_num_kv,
-            head_dim=self.head_dim,
-            dtype=cache_dtype,
-            gpu_cache_pred=2,
-            cpu_cache_pred=2
-        )
 
         # ---- build layers ----
         self.layers = []
@@ -967,69 +959,69 @@ def run_flexgen(args):
         qwen_config, env, args.path, policy,
         partial_weight_ratio=args.partial_weight_ratio,
         alpha=args.alpha,
-        max_num_kv=args.max_num_kv
+        max_num_kv=args.max_num_kv,
+        gpu_cache_num=args.gpu_cache_num,
+        gpu_cache_pred=args.gpu_cache_pred,
+        cpu_cache_pred=args.cpu_cache_pred,
     )
 
-    head_dim = model.head_dim
-    head_num = model.head_num
-    for l in range(model.config.num_hidden_layers):
+    head_dim = getattr(qwen_config, "head_dim",
+                       qwen_config.hidden_size // qwen_config.num_attention_heads)
+    use_gpu_cache = args.gpu_cache_num != 0
+    cache_device = "cuda:0" if use_gpu_cache else "cpu"
+    for l in range(qwen_config.num_hidden_layers):
+        max_token_len = max(args.prompt_len, 2048) + max(args.gen_len, 1)
         model._cache_manager.add_cache(
-            device="cuda:0",
+            device=cache_device,
             layer_id=l,
             batch_size=num_prompts,
-            head_num=head_num,
+            head_num=getattr(qwen_config, "num_key_value_heads", qwen_config.num_attention_heads),
+            max_token_len=max_token_len,
             sparse_len=args.max_num_kv,
-            hidden_size=head_dim
+            hidden_size=head_dim,
+            use_gpu_cache=use_gpu_cache,
         )
 
-    ##################### profile
-#     activities = [ProfilerActivity.CPU, ProfilerActivity.CUDA]
-
-#     try:
-#         print("warmup - generate")
-#         _ = model.generate(warmup_inputs, max_new_tokens=1, verbose=args.verbose, warmup=True)
-#         torch.cuda.synchronize()
-
-#         print("benchmark - generate")
-#         timers("generate").reset()
-
-#         with profile(activities=activities, with_stack=True) as prof:
-#             output_ids = model.generate(
-#                 inputs,
-#                 max_new_tokens=args.gen_len,
-#                 debug_mode=args.debug_mode,
-#                 cut_gen_len=args.cut_gen_len,
-#                 verbose=args.verbose,
-#                 warmup=False
-#             )
-
-#         # 保存 profile
-#         prof.export_chrome_trace(
-#             f"/root/sparse-load/SparseCache/speedup/profile_mycache_gpu_b{args.gpu_batch_size}_i{args.prompt_len}_o{args.gen_len}.json"
-#         )
-#         # prof.export_chrome_trace(f"/NVME1/projects/qin/InfiniGen-main/speedup/profile_mycache_b{args.gpu_batch_size}_i{args.prompt_len}_o{args.gen_len}.json")
-
-#         costs = timers("generate").costs
-#     finally:
-#         env.close_copy_threads()
-
-    ##################### profile
-
+    use_profile = False  # toggle for torch.profiler runs
     try:
-        print("warmup - generate")
-        _ = model.generate(warmup_inputs, max_new_tokens=1, verbose=args.verbose, warmup=True)
+        if use_profile:
+            from torch.profiler import profile, ProfilerActivity
+            activities = [ProfilerActivity.CPU, ProfilerActivity.CUDA]
 
-        print("benchmark - generate")
-        timers("generate").reset()
-        output_ids = model.generate(
-            inputs,
-            max_new_tokens=args.gen_len,
-            debug_mode=args.debug_mode,
-            cut_gen_len=args.cut_gen_len,
-            verbose=args.verbose,
-            warmup=False
-        )
-        costs = timers("generate").costs
+            print("warmup - generate")
+            _ = model.generate(warmup_inputs, max_new_tokens=1, verbose=args.verbose, warmup=True)
+            torch.cuda.synchronize()
+
+            print("benchmark - generate")
+            timers("generate").reset()
+            with profile(activities=activities, with_stack=True) as prof:
+                output_ids = model.generate(
+                    inputs,
+                    max_new_tokens=args.gen_len,
+                    debug_mode=args.debug_mode,
+                    cut_gen_len=args.cut_gen_len,
+                    verbose=args.verbose,
+                    warmup=False
+                )
+            prof.export_chrome_trace(
+                f"/root/InfiniGen/speedup/profile_mycache_gpu_b{args.gpu_batch_size}_i{args.prompt_len}_o{args.gen_len}.json"
+            )
+            costs = timers("generate").costs
+        else:
+            print("warmup - generate")
+            _ = model.generate(warmup_inputs, max_new_tokens=1, verbose=args.verbose, warmup=True)
+
+            print("benchmark - generate")
+            timers("generate").reset()
+            output_ids = model.generate(
+                inputs,
+                max_new_tokens=args.gen_len,
+                debug_mode=args.debug_mode,
+                cut_gen_len=args.cut_gen_len,
+                verbose=args.verbose,
+                warmup=False
+            )
+            costs = timers("generate").costs
     finally:
         env.close_copy_threads()
 
@@ -1102,6 +1094,13 @@ def add_parser_arguments(parser):
     parser.add_argument("--alpha", type=int, default=4)
     parser.add_argument("--partial-weight-ratio", type=float, default=0.2)
     parser.add_argument("--max-num-kv", type=int, default=400)
+    parser.add_argument("--gpu-cache-num", type=int, default=0,
+                        help="GPU cache pool 的数量/分片数；为 0 时使用 CPU cache pool")
+    parser.add_argument("--gpu-cache-pred", type=float, default=1.0,
+                        help="GPU cache 容量倍率，相对于 max-num-kv")
+    parser.add_argument("--cpu-cache-pred", type=float, default=1.0,
+                        help="CPU cache 容量倍率，相对于 max-num-kv")
+ 
 
     parser.add_argument("--warmup-input-path", type=str, required=True)
     parser.add_argument("--test-input-path", type=str, required=True)

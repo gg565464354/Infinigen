@@ -4,6 +4,7 @@ import my_cache_load._C as _C
 from concurrent.futures import ThreadPoolExecutor
 
 import sys
+import math
 
 class CacheManager:
     '''
@@ -50,10 +51,10 @@ class CacheManager:
         # pinned space for cached tensor
         self._pinned_cached_k_list = {}
         self._pinned_cached_v_list = {}
-        self.gpu_cache_pred = gpu_cache_pred
-        self.cpu_cache_pred = cpu_cache_pred
-        self._max_cpu_cached_len = max_sparse_len * self.gpu_cache_pred
-        self._max_gpu_cached_len = max_sparse_len * self.cpu_cache_pred
+        self.gpu_cache_pred = float(gpu_cache_pred)
+        self.cpu_cache_pred = float(cpu_cache_pred)
+        self._max_cpu_cached_len = max(1, int(math.ceil(max_sparse_len * self.cpu_cache_pred)))
+        self._max_gpu_cached_len = max(1, int(math.ceil(max_sparse_len * self.gpu_cache_pred)))
         # self._max_cached_len = 0
         # self._pinned_cache_shape = {}
 
@@ -370,8 +371,8 @@ class CacheManager:
         # step 1: 如果预留的pinned tensor不够大, 创建新的pinned tensor
         if layer_id not in self._pinned_cached_k_list:
             pinned_cache_shape = (self.max_sparse_len, self.bh, self.head_dim)
-            k_cache_space = torch.empty(pinned_cache_shape, dtype=self.dtype, device=self.device, pin_memory=True)
-            v_cache_space = torch.empty(pinned_cache_shape, dtype=self.dtype, device=self.device, pin_memory=True)
+            k_cache_space = torch.empty(pinned_cache_shape, dtype=self.dtype, pin_memory=True)
+            v_cache_space = torch.empty(pinned_cache_shape, dtype=self.dtype, pin_memory=True)
             self._pinned_cached_k_list[layer_id] = [k_cache_space]
             self._pinned_cached_v_list[layer_id] = [v_cache_space]
 
@@ -429,8 +430,8 @@ class CacheManager:
         # step 1: 如果预留的pinned tensor不够大, 创建新的pinned tensor
         if layer_id not in self._pinned_cached_k_list:
             pinned_cache_shape = (self.max_sparse_len, self.bh, self.head_dim)
-            k_cache_space = torch.empty(pinned_cache_shape, dtype=self.dtype, device=self.device, pin_memory=True)
-            v_cache_space = torch.empty(pinned_cache_shape, dtype=self.dtype, device=self.device, pin_memory=True)
+            k_cache_space = torch.empty(pinned_cache_shape, dtype=self.dtype, pin_memory=True)
+            v_cache_space = torch.empty(pinned_cache_shape, dtype=self.dtype, pin_memory=True)
             self._pinned_cached_k_list[layer_id] = [k_cache_space]
             self._pinned_cached_v_list[layer_id] = [v_cache_space]
 
@@ -460,8 +461,8 @@ class CacheManager:
 
         # Step 6: 并行开始 KV 的 GPU 传输（异步）
         with torch.cuda.stream(transfer_stream):
-            group_gpu_k = [layer_pinned_k_space.cuda(non_blocking=True)]
-            group_gpu_v = [layer_pinned_v_space.cuda(non_blocking=True)]
+            group_gpu_k = [k.cuda(non_blocking=True) for k in final_cpu_k]
+            group_gpu_v = [v.cuda(non_blocking=True) for v in final_cpu_v]
         
         
         # Step 7: 等待 CPU 计算结束
@@ -533,7 +534,7 @@ class CacheManager:
 
     # 统一的更新和加载接口
     def unified_load_api(self, layer_id, transfer_stream, prefetch_idx, pad_idx, all_k, all_v, dtype):
-        if layer_id in self._use_gpu_cache:
+        if self._use_gpu_cache.get(layer_id, False):
             # 判断是否需要更新
             if self._require_update[layer_id]:
                 # 直接更新cache

@@ -271,9 +271,6 @@ class SelfAttention:
             device = device.compressed_device
 
         k_cache, v_cache = device.init_cache_one_gpu_batch_infin(self.config, self.task, self.policy)
-        if (device.device_type == DeviceType.CPU and isinstance(k_cache, TorchTensor)):
-            k_cache = TorchTensor.create_from_torch(k_cache.data, device)
-            v_cache = TorchTensor.create_from_torch(v_cache.data, device)
         cache_home.store((k_cache, v_cache))
         if self.layer_id == 0:  # 只打印一次避免刷屏，你也可以改成 layer_id > 1 等
             print(f"[cache init] device={device.device_type} layer={self.layer_id} "
@@ -343,12 +340,8 @@ class SelfAttention:
                 #     k_data = k_data.to(torch.float16)
                 #     v_data = v_data.to(torch.float16)
                 #     cache_dtype = config.torch_dtype
-
                 if not self._cache_manager._require_update.get(self.layer_id, False):
                     prefetch_idx_int = self._cache_manager.cache_miss_check(self.layer_id, prefetch_idx_int)
-                prefetch_idx_int = prefetch_idx_int.to(torch.int32)
-                pad_idx_int = pad_idx_int.to(torch.int32)
-
                 group_gpu_k, group_gpu_v, group_unhit = self._cache_manager.unified_load_api(
                     self.layer_id, prefetch_cache_stream, prefetch_idx_int, pad_idx_int,
                     k_data, v_data, cache_dtype
@@ -542,9 +535,7 @@ class OptLM:
 
         self.head_num = getattr(self.config, "num_key_value_heads", self.config.num_attention_heads)
         self.head_dim = getattr(self.config, "head_dim", self.config.hidden_size // self.config.num_attention_heads)
-        
-        # 修改成根据config 确定dtype
-        cache_dtype = self.config.torch_dtype
+        cache_dtype = config.torch_dtype
 
         original_head_group_ids = {}
         for l in range(self.config.num_hidden_layers):
@@ -976,10 +967,10 @@ def run_flexgen(args):
 
     head_dim = getattr(qwen_config, "head_dim",
                        qwen_config.hidden_size // qwen_config.num_attention_heads)
-    max_token_len = max(args.prompt_len, 2048) + max(args.gen_len, 1)
     use_gpu_cache = args.gpu_cache_num != 0
     cache_device = "cuda:0" if use_gpu_cache else "cpu"
     for l in range(qwen_config.num_hidden_layers):
+        max_token_len = max(args.prompt_len, 2048) + max(args.gen_len, 1)
         model._cache_manager.add_cache(
             device=cache_device,
             layer_id=l,
