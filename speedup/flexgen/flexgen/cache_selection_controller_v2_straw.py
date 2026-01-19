@@ -136,10 +136,9 @@ class CacheManager:
         """
         if layer_id in self._caches:
             raise ValueError("Python ERROR! [add_cache] layer id is used!")
-            return 1
         
-        # print(f"Cache Manager add cache Layer #{layer_id}", flush=True)
-        # print_gpu_memory()
+        if not use_gpu_cache
+            raise ValueError("Python ERROR! [add_cache] stawman only use gpu cache!")
 
         # print(f"CacheManager add_cache: Layer#{layer_id} max_token_len={max_token_len}", flush=True)
         
@@ -149,22 +148,11 @@ class CacheManager:
         # 在这里决定他是否要使用gpu cache
         self._use_gpu_cache[layer_id] = use_gpu_cache
         
-        # if cpu_cache build  pinned kv pool space on cpu
-        if use_gpu_cache:
-            # gpu cache only require (max_sparse_len, bh, D) shape pinned pool
-            pinned_cache_shape = (self.max_sparse_len, self.bh, self.head_dim)
-            k_cache_space = torch.empty(pinned_cache_shape, dtype=self.dtype, pin_memory=True)
-            v_cache_space = torch.empty(pinned_cache_shape, dtype=self.dtype, pin_memory=True)
-            self._pinned_cached_k_list[layer_id] = [k_cache_space]
-            self._pinned_cached_v_list[layer_id] = [v_cache_space]
-        else:
-            # cpu cache require (max_sparse_len, bh, D) shape pinned pool
-            cpu_cache_pred = self._max_cpu_cached_len
-            pinned_cache_shape = (cpu_cache_pred, self.bh, self.head_dim)
-            k_cache_space = torch.empty(pinned_cache_shape, dtype=self.dtype, pin_memory=True)
-            v_cache_space = torch.empty(pinned_cache_shape, dtype=self.dtype, pin_memory=True)
-            self._pinned_cached_k_list[layer_id] = [k_cache_space]
-            self._pinned_cached_v_list[layer_id] = [v_cache_space]
+        pinned_cache_shape = (self.max_sparse_len, self.bh, self.head_dim)
+        k_cache_space = torch.empty(pinned_cache_shape, dtype=self.dtype, pin_memory=True)
+        v_cache_space = torch.empty(pinned_cache_shape, dtype=self.dtype, pin_memory=True)
+        self._pinned_cached_k_list[layer_id] = [k_cache_space]
+        self._pinned_cached_v_list[layer_id] = [v_cache_space]
 
         return 0
 
@@ -236,141 +224,6 @@ class CacheManager:
         update_cache_map_(W_cache, W_sparse_gpu)
         
         return unhit_idx_cpu
-
-        
-    
-    def cpu_cache_load(self, layer_id, transfer_stream, unhit_idx, pad_idx, all_k, all_v, dtype):
-        '''
-            prefetch_idx (n', 1, bh)
-            pad_idx (1, 1, bh)
-        '''
-        # print("################################# cpu_load Layer #", layer_id)
-        # print_gpu_memory()
-        
-        # step0: get layer cache context
-        cur_cache_map = self.layer_cache_maps[layer_id]
-        cur_unhit_map = self.layer_unhit_maps[layer_id].cpu()
-        cur_pad_idx = pad_idx
-        cur_unhit_length = self.layer_unhit_lengths[layer_id]
-        cur_sparse_maps = self.layer_sparse_maps[layer_id]
-        
-        group_cached_k, group_cached_v = self._cpu_cached_group_kv[layer_id]
-        
-        # step1: build unhit tensor asyn (maybe we should use cpp module)
-        bh = unhit_idx.shape[-1]
-        cur_pad_idx_list = cur_pad_idx[0][0].int().tolist()
-        cur_unhit_length_list = cur_unhit_length.int().tolist()
-        max_unhit_len = max(cur_unhit_length_list)
-        unhit_total_len = sum(cur_unhit_length_list)
-        
-        
-        pad_len = 1
-        # future_unhit = self.executor.submit(
-        #     _C.select_kv_from_unhit_map_with_lengths,
-        #     cur_unhit_map, 
-        #     cur_unhit_length_list,
-        #     all_k,
-        #     all_v, 
-        #     self._pinned_flat_unhit_k[1:1+unhit_total_len], 
-        #     self._pinned_flat_unhit_v[1:1+unhit_total_len]
-        # )
-        
-        
-        # future_unhit = self.executor.submit(cur_cache.get_unhit_kv_tensor_v5, prefetch_idx_int, pad_idx_list, all_k, all_v, self._pinned_unhit_k_list, self._pinned_unhit_v_list)
-        
-        
-        # step2: parallelly transfer cpu kv pools
-        with torch.cuda.stream(transfer_stream):
-            group_cached_gpu_k = [k.cuda(non_blocking=True) for k in group_cached_k]
-            group_cached_gpu_v = [v.cuda(non_blocking=True) for v in group_cached_v]
-        
-            # Step 3: 等待 CPU 计算结束
-            # try:
-            #     pad_unhit_id_map = future_unhit.result()
-            # except Exception as e:
-            #     print(f"CPU Cache load select_kv_tensor_with_pad error: {e}")
-
-            pad_unhit_id_map = _C.select_kv_from_unhit_map_with_lengths(
-                cur_unhit_map, 
-                cur_unhit_length_list,
-                all_k,
-                all_v, 
-                self._pinned_flat_unhit_k[1:1+unhit_total_len], 
-                self._pinned_flat_unhit_v[1:1+unhit_total_len]
-            )
-            
-            self._pinned_flat_unhit_k[0] = 0
-            self._pinned_flat_unhit_v[0] = 0
-
-
-            # step4: 复制unhit KV到pinned memory
-            tmp_unhit_k = self._pinned_flat_unhit_k[:unhit_total_len+pad_len, :]
-            tmp_unhit_v = self._pinned_flat_unhit_v[:unhit_total_len+pad_len, :]
-            flat_unhit_k = tmp_unhit_k
-            flat_unhit_v = tmp_unhit_v
-
-
-        # Step 5: unhit_k/v -> GPU 传输 + 拼接（仍在 transfer_stream）
-        # with torch.cuda.stream(transfer_stream):
-            unhit_gpu_k = flat_unhit_k.cuda(non_blocking=True)
-            unhit_gpu_v = flat_unhit_v.cuda(non_blocking=True)
-
-            group_final_k = [(group_cached_gpu_k[0], unhit_gpu_k)]
-            group_final_v = [(group_cached_gpu_v[0], unhit_gpu_v)]
-            
-            unhit_kv_map = pad_unhit_id_map.cuda()
-
-        # 打印日志 cur_unhit_length_list
-#         print("max_unhit_len =", max_unhit_len)
-#         # print("cur_unhit_length_list =", cur_unhit_length_list)
-#         print("pad_unhit_id_map shape =", pad_unhit_id_map.shape)
-#         group_cache_shape = [cache.shape for cache in group_cached_k]
-#         print("group_cache_shape = ", group_cache_shape)
-#         group_unhit_shape = [flat_unhit_k.shape]
-#         print("group_unhit_shape = ", group_unhit_shape)
-        
-        
-
-        ################################################## 
-        # Final step: 开始更新cpu cache
-        # data: group_cached_k, group_unhit_k
-        cur_cache_len = group_cached_k[0].shape[0]
-
-        # 不考虑进行渐进式更新
-        # 如果剩余cache空间足够，更新cache
-#         if self._max_cpu_cached_len >= (cur_cache_len + max_unhit_len):
-#             new_group_cached_k = []
-#             new_group_cached_v = []
-#             # new_group_unhit = []
-#             # for i in range(len(group_cached_k)):
-            
-#             cur_pinned_cached_k = self._pinned_cached_k_list[layer_id][0]
-#             cur_pinned_cached_v = self._pinned_cached_v_list[layer_id][0]
-
-#             cur_unhit_len = max_unhit_len
-#             cur_final_len = cur_cache_len + cur_unhit_len
-
-#             cur_pinned_cached_k[cur_cache_len:cur_final_len, :, :] = group_unhit_k[i][:cur_unhit_len, :, :]
-#             cur_pinned_cached_v[cur_cache_len:cur_final_len, :, :] = group_unhit_v[i][:cur_unhit_len, :, :]
-
-#             new_group_cached_k.append(cur_pinned_cached_k[:cur_final_len])
-#             new_group_cached_v.append(cur_pinned_cached_v[:cur_final_len])
-
-            
-#             # step5: update cache map (update at miss check)
-#             # update_cache_map_(cur_cache_map, cur_sparse_maps)
-            
-#             self._cpu_cached_group_kv[layer_id] = (new_group_cached_k, new_group_cached_v)
-#         else:
-#             # 剩余空间不够
-#             self._require_update[layer_id] = True
-        
-            
-        # print("################################# cpu_load")
-
-        return group_final_k, group_final_v, unhit_kv_map
-        
-        
         
     
     def gpu_cache_load(self, layer_id, transfer_stream, unhit_idx, pad_idx, all_k, all_v, dtype):
@@ -378,10 +231,7 @@ class CacheManager:
             prefetch_idx (n', 1, bh)
             pad_idx (1, 1, bh)
         '''
-        
-        # print("################################# gpu_load Layer #", layer_id)
-        # print(f"Layer #{layer_id} use gpu_cache_load")
-        
+
         # step0: get layer cache context
         cur_cache_map = self.layer_cache_maps[layer_id]
         cur_unhit_idx = unhit_idx.cpu()
@@ -444,13 +294,8 @@ class CacheManager:
  
     
     def load_and_update_gpu_cached(self, layer_id, transfer_stream, prefetch_idx, all_k, all_v, dtype):
-        # print(f"Layer #{layer_id} use load_and_update_gpu_cached")
-        
-#         print_gpu_memory()
-        
-        # cur_group_ids = self._cur_group_ids[layer_id]
-        
-        
+
+
         # step 1: 如果预留的pinned tensor不够大, 创建新的pinned tensor
         if layer_id not in self._pinned_cached_k_list:
             pinned_cache_shape = (self.max_sparse_len, self.bh, self.head_dim)
@@ -495,118 +340,69 @@ class CacheManager:
         return group_gpu_k, group_gpu_v, group_cpu_k, group_cpu_v
 
 
-    def load_and_update_cpu_cache(self, layer_id, transfer_stream, prefetch_idx, all_k, all_v, dtype):
 
-        # cur_group_ids = self._cur_group_ids[layer_id]
-
-        # print(f"CacheManager load_and_update_cpu_cache Layer #{layer_id}", flush=True)
-        
-        # print_gpu_memory()
-        
-
-        
-        # step 1: 如果预留的pinned tensor不够大, 创建新的pinned tensor
-        if layer_id not in self._pinned_cached_k_list:
-            pinned_cache_shape = (self.max_sparse_len, self.bh, self.head_dim)
-            k_cache_space = torch.empty(pinned_cache_shape, dtype=self.dtype, device=torch.device('cpu'), pin_memory=True)
-            v_cache_space = torch.empty(pinned_cache_shape, dtype=self.dtype, device=torch.device('cpu'), pin_memory=True)
-            self._pinned_cached_k_list[layer_id] = [k_cache_space]
-            self._pinned_cached_v_list[layer_id] = [v_cache_space]
-
-        # Step 2: get pinned cache space
-        layer_pinned_k_space = self._pinned_cached_k_list[layer_id][0]
-        layer_pinned_v_space = self._pinned_cached_v_list[layer_id][0]
-        cur_sparse_len = prefetch_idx.shape[0]
-        final_cpu_k = [layer_pinned_k_space[:cur_sparse_len]]
-        final_cpu_v = [layer_pinned_v_space[:cur_sparse_len]]
-
-        # Step 3: 获取新的kv数据
-        selected_k, selected_v = select_kv(prefetch_idx, all_k, all_v)
-        group_cpu_k = [selected_k]
-        group_cpu_v = [selected_v]
-        
-        # Step 4: 将数据拷贝到pinned_tensor中
-        final_cpu_k[0].copy_(selected_k)
-        final_cpu_v[0].copy_(selected_v)
-        
-        
-        # print("Cache Manager load_and_update_cpu_cache #4", flush=True)
-        # torch.cuda.synchronize() 
-
-        # Step 5: 提前cpu cache更新任务
-        W_cache_map = build_sparse_map(prefetch_idx, self.max_token_len, 'cuda')
-        self.layer_cache_maps[layer_id] = W_cache_map
-
-        # Step 6: 并行开始 KV 的 GPU 传输（异步）
-        with torch.cuda.stream(transfer_stream):
-            group_gpu_k = [final_cpu_k[0].cuda(non_blocking=True)]
-            group_gpu_v = [final_cpu_v[0].cuda(non_blocking=True)]
-        
-        # step7: set as new cpu pool
-        
-        self._cpu_cached_group_kv[layer_id] = (final_cpu_k, final_cpu_v)
-        
-        
-        # print(f"CacheManager L{layer_id} after update: {sys.getrefcount(old_k_cache)}", flush=True)
-        
-
-        return group_gpu_k, group_gpu_v, group_cpu_k, group_cpu_v
-    
-
-    def update_gpu_cache_with_new_tensor(self, layer_id, new_k_cache, new_v_cache):
-        '''
-            Directly update cache.
-            Be called before attention.
-            The cache map is update when get unhit.
-        '''
-        if not self._use_gpu_cache[layer_id]:
-            return
-        
-        # self._gpu_cached_group_kv[layer_id] = (new_k_cache, new_v_cache)
-        pass
-
-
-    # 统一的更新和加载接口
+    # 统一的更新和加载接口 （默认全是GPU Cache）
     def unified_load_api(self, layer_id, transfer_stream, unhit_idx, pad_idx, all_k, all_v, dtype):
-        if self._use_gpu_cache[layer_id]:
-            # 判断是否需要更新
-            if self._require_update[layer_id]:
-                # 直接更新cache
-                self._update_recode[layer_id] = 0
-                self._require_update[layer_id] = False
-                
-                group_gpu_k, group_gpu_v, group_cpu_k, group_cpu_v = self.load_and_update_gpu_cached(layer_id, transfer_stream, unhit_idx, all_k, all_v, dtype)
-                
-                return (group_gpu_k, group_gpu_v, None)
-            else:
-                self._update_recode[layer_id] += 1
-                
-                # version 3
-                group_final_k, group_final_v, unhit_id_map = self.gpu_cache_load(layer_id, transfer_stream, unhit_idx, pad_idx, all_k, all_v, dtype)
-                
-                # if self._update_recode[layer_id] > self._update_pred:
-                #     self._require_update[layer_id] = True
-                
-                return (group_final_k, group_final_v, unhit_id_map)
+        # 判断是否需要更新
+        if self._require_update[layer_id]:
+            # 直接更新cache
+            self._update_recode[layer_id] = 0
+            self._require_update[layer_id] = False
+            
+            group_gpu_k, group_gpu_v, group_cpu_k, group_cpu_v = self.load_and_update_gpu_cached(layer_id, transfer_stream, unhit_idx, all_k, all_v, dtype)
+            
+            return (group_gpu_k, group_gpu_v, None)
         else:
-            # 判断是否需要更新
-            if self._require_update[layer_id]:
-                # 直接更新cache
-                self._update_recode[layer_id] = 1
-                self._require_update[layer_id] = False
-                group_gpu_k, group_gpu_v, group_cpu_k, group_cpu_v = self.load_and_update_cpu_cache(layer_id, transfer_stream, unhit_idx, all_k, all_v, dtype)
+            self._update_recode[layer_id] += 1
+            
+            # version 3
+            group_final_k, group_final_v, unhit_id_map = self.gpu_cache_load(layer_id, transfer_stream, unhit_idx, pad_idx, all_k, all_v, dtype)
+            
+            if self._update_recode[layer_id] > self._update_pred:
+                self._require_update[layer_id] = True
+            
+            return (group_final_k, group_final_v, unhit_id_map)
+        
+        
+        # if self._use_gpu_cache[layer_id]:
+        #     # 判断是否需要更新
+        #     if self._require_update[layer_id]:
+        #         # 直接更新cache
+        #         self._update_recode[layer_id] = 0
+        #         self._require_update[layer_id] = False
                 
-                return (group_gpu_k, group_gpu_v, None)
-            else:
+        #         group_gpu_k, group_gpu_v, group_cpu_k, group_cpu_v = self.load_and_update_gpu_cached(layer_id, transfer_stream, unhit_idx, all_k, all_v, dtype)
                 
-                self._update_recode[layer_id] += 1
+        #         return (group_gpu_k, group_gpu_v, None)
+        #     else:
+        #         self._update_recode[layer_id] += 1
                 
-                group_final_k, group_final_v, unhit_id_map = self.cpu_cache_load(layer_id, transfer_stream, unhit_idx, pad_idx, all_k, all_v, dtype)
+        #         # version 3
+        #         group_final_k, group_final_v, unhit_id_map = self.gpu_cache_load(layer_id, transfer_stream, unhit_idx, pad_idx, all_k, all_v, dtype)
                 
-                if self._update_recode[layer_id] > self._update_pred:
-                    self._require_update[layer_id] = True
+        #         # if self._update_recode[layer_id] > self._update_pred:
+        #         #     self._require_update[layer_id] = True
                 
-                return (group_final_k, group_final_v, unhit_id_map)
+        #         return (group_final_k, group_final_v, unhit_id_map)
+        # else:
+        #     # 判断是否需要更新
+        #     if self._require_update[layer_id]:
+        #         # 直接更新cache
+        #         self._update_recode[layer_id] = 1
+        #         self._require_update[layer_id] = False
+        #         group_gpu_k, group_gpu_v, group_cpu_k, group_cpu_v = self.load_and_update_cpu_cache(layer_id, transfer_stream, unhit_idx, all_k, all_v, dtype)
+                
+        #         return (group_gpu_k, group_gpu_v, None)
+        #     else:
+                
+        #         self._update_recode[layer_id] += 1
+                
+        #         group_final_k, group_final_v, unhit_id_map = self.cpu_cache_load(layer_id, transfer_stream, unhit_idx, pad_idx, all_k, all_v, dtype)
+                
+        #         if self._update_recode[layer_id] > self._update_pred:
+        #             self._require_update[layer_id] = True
+                
+        #         return (group_final_k, group_final_v, unhit_id_map)
 
 
         

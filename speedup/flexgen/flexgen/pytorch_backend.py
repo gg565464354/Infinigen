@@ -115,8 +115,9 @@ def speculate_attention_grouped(
     p_q = F.linear(hidden, p_w_q, bias=None)
     p_q = p_q.view(b, 1, n_head, -1)
     p_q = p_q.permute(0, 2, 1, 3).reshape(b * n_head, 1, -1)
-
+    print(p_q.dtype, p_k_c.dtype)
     p_attn = torch.bmm(p_q, p_k_c.permute(1, 2, 0))  # (b*n_head, 1, n)
+    
     p_attn = p_attn.squeeze(1).view(b, n_head, -1)
 
     if n_kv_head is None:
