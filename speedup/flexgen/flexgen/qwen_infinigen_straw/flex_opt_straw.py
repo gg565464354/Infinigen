@@ -271,6 +271,9 @@ class SelfAttention:
             device = device.compressed_device
 
         k_cache, v_cache = device.init_cache_one_gpu_batch_infin(self.config, self.task, self.policy)
+        if (device.device_type == DeviceType.CPU and isinstance(k_cache, TorchTensor)):
+            k_cache = TorchTensor.create_from_torch(k_cache.data, device)
+            v_cache = TorchTensor.create_from_torch(v_cache.data, device)
         cache_home.store((k_cache, v_cache))
         if self.layer_id == 0:  # 只打印一次避免刷屏，你也可以改成 layer_id > 1 等
             print(f"[cache init] device={device.device_type} layer={self.layer_id} "
@@ -336,14 +339,16 @@ class SelfAttention:
                 k_data = k_home.data
                 v_data = v_home.data
                 cache_dtype = k_home.dtype
-                if (
-                    isinstance(k_data, torch.Tensor)
-                    and k_data.dtype == torch.bfloat16
-                    and getattr(self._cache_manager, "dtype", None) == torch.float16
-                ):
-                    k_data = k_data.to(torch.float16)
-                    v_data = v_data.to(torch.float16)
-                    cache_dtype = torch.float16
+                # if isinstance(k_data, torch.Tensor) and k_data.dtype == torch.bfloat16:
+                #     k_data = k_data.to(torch.float16)
+                #     v_data = v_data.to(torch.float16)
+                #     cache_dtype = config.torch_dtype
+
+                if not self._cache_manager._require_update.get(self.layer_id, False):
+                    prefetch_idx_int = self._cache_manager.cache_miss_check(self.layer_id, prefetch_idx_int)
+                prefetch_idx_int = prefetch_idx_int.to(torch.int32)
+                pad_idx_int = pad_idx_int.to(torch.int32)
+
                 group_gpu_k, group_gpu_v, group_unhit = self._cache_manager.unified_load_api(
                     self.layer_id, prefetch_cache_stream, prefetch_idx_int, pad_idx_int,
                     k_data, v_data, cache_dtype
@@ -463,10 +468,8 @@ class SelfAttention:
             k_cache_buf = TorchTensor.create_from_torch(k_cache_buf, self.compute)
             v_cache_buf = TorchTensor.create_from_torch(v_cache_buf, self.compute)
 
-        target_dtype = self.config.torch_dtype
-        if k_cache_buf.data.dtype != target_dtype:
-            k_cache_buf.data = k_cache_buf.data.to(target_dtype)
-            v_cache_buf.data = v_cache_buf.data.to(target_dtype)
+        k_cache_buf.data = k_cache_buf.data.to(torch.bfloat16)
+        v_cache_buf.data = v_cache_buf.data.to(torch.bfloat16)
 
         if self.enable_prefetching:
             partial_k_cache = partial_cache_read_buf.val
@@ -497,14 +500,6 @@ class SelfAttention:
                 None, None, None,
                 self.alpha, self.max_num_kv
             )
-
-        if self.prefetch_idx is not None:
-            if isinstance(self.prefetch_idx, tuple):
-                sparse_idx, pad_idx = self.prefetch_idx
-                new_sparse_idx = self._cache_manager.cache_miss_check(self.layer_id + 1, sparse_idx)
-                self.prefetch_idx = (new_sparse_idx, pad_idx)
-            else:
-                self.prefetch_idx = self._cache_manager.cache_miss_check(self.layer_id + 1, self.prefetch_idx)
 
         cache_write_buf.store((new_k_cache, new_v_cache))
 
@@ -547,7 +542,9 @@ class OptLM:
 
         self.head_num = getattr(self.config, "num_key_value_heads", self.config.num_attention_heads)
         self.head_dim = getattr(self.config, "head_dim", self.config.hidden_size // self.config.num_attention_heads)
-        cache_dtype = config.torch_dtype
+        
+        # 修改成根据config 确定dtype
+        cache_dtype = self.config.torch_dtype
 
         original_head_group_ids = {}
         for l in range(self.config.num_hidden_layers):
@@ -557,7 +554,7 @@ class OptLM:
             layer_head_num=self.head_num,
             batch_size=self.policy.gpu_batch_size,
             head_num=self.head_num,
-            max_sparse_len=max_num_kv + 32,
+            max_sparse_len=max_num_kv,
             head_dim=self.head_dim,
             dtype=cache_dtype,
             gpu_cache_pred=self.gpu_cache_pred,
@@ -979,17 +976,17 @@ def run_flexgen(args):
 
     head_dim = getattr(qwen_config, "head_dim",
                        qwen_config.hidden_size // qwen_config.num_attention_heads)
+    max_token_len = max(args.prompt_len, 2048) + max(args.gen_len, 1)
     use_gpu_cache = args.gpu_cache_num != 0
     cache_device = "cuda:0" if use_gpu_cache else "cpu"
     for l in range(qwen_config.num_hidden_layers):
-        max_token_len = args.prompt_len + args.gen_len
         model._cache_manager.add_cache(
             device=cache_device,
             layer_id=l,
             batch_size=num_prompts,
             head_num=getattr(qwen_config, "num_key_value_heads", qwen_config.num_attention_heads),
             max_token_len=max_token_len,
-            sparse_len=int(args.max_num_kv + 32),
+            sparse_len=args.max_num_kv,
             hidden_size=head_dim,
             use_gpu_cache=use_gpu_cache,
         )
