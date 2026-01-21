@@ -91,41 +91,70 @@ def repeat_kv_cache(x: torch.Tensor, n_rep: int, n_kv_head: int):
     x = x.reshape(s, b * (n_kv_head * n_rep), d)
     return x
 
+def rms_norm(input: torch.Tensor, weight: torch.Tensor, eps: float = 1e-6):
+    input_dtype = input.dtype
+    # 计算 RMS（Root Mean Square）
+    variance = input.to(torch.float32).pow(2).mean(dim=-1, keepdim=True)
+    # 归一化
+    hidden_states = input * torch.rsqrt(variance + eps)
+    # 缩放
+    return (weight * hidden_states).to(input_dtype)
 
-def speculate_attention_gqa(hidden, p_w_q, p_k_c, n_head, n_kv_head, alpha, max_num_kv):
-    if n_kv_head is None or n_kv_head == n_head:
-        return speculate_attention(hidden, p_w_q, p_k_c, n_head, alpha, max_num_kv)
-
-    b = hidden.shape[0]
-    p_q = F.linear(hidden, p_w_q, bias=None)
-    p_q = p_q.view(b, 1, n_head, -1)
-    p_q = p_q.permute(0, 2, 1, 3).reshape(b * n_head, 1, -1)
-
-    p_attn = torch.bmm(p_q, p_k_c.permute(1, 2, 0))  # (b*n_head, 1, n)
-    n = p_attn.shape[-1]
-    if n == 0:
-        return None
-
-    if n_head % n_kv_head != 0:
-        raise ValueError(f"n_head ({n_head}) must be divisible by n_kv_head ({n_kv_head})")
+def rms_norm_gqa(x, weight, eps=1e-6):
+    """
+    RMSNorm for GQA-expanded tensor.
+    
+    Args:
+        x: (b, s, n_head, d)
+        weight: (n_kv_head * d,)  ← original GQA norm weight
+        eps: epsilon
+    
+    Returns:
+        normalized x: (b, s, n_head, d)
+    """
+    n_head = x.shape[2]
+    n_kv_head = weight.shape[0] // x.shape[3]  # weight.size = n_kv_head * d
+    assert n_head % n_kv_head == 0
     rep = n_head // n_kv_head
-    p_attn = p_attn.view(b, n_head, n).view(b, n_kv_head, rep, n).mean(dim=2)
-    p_attn = p_attn.reshape(b * n_kv_head, 1, n)
+    head_dim = x.shape[3]
 
-    max_ = torch.max(p_attn, dim=-1)[0]
-    thr_ = (max_ - alpha).unsqueeze(-1).repeat(1, 1, p_attn.shape[-1])
-    count = torch.where(
-        p_attn > thr_, torch.ones_like(p_attn), torch.zeros_like(p_attn)
-    )
-    mean = torch.mean(torch.sum(count, dim=-1)).item()
-    topk = min(int(mean), max_num_kv)
-    if topk <= 0:
-        return None
+    # Reshape x: (b, s, n_head, d) -> (b, s, n_kv_head, rep, d)
+    x = x.view(x.shape[0], x.shape[1], n_kv_head, rep, head_dim)
 
-    prefetch_idx = torch.topk(p_attn.permute(2, 1, 0), topk, dim=0)[1]
-    return prefetch_idx
+    # Reshape weight: (n_kv_head * d,) -> (n_kv_head, 1, 1, d)
+    #                                → will broadcast to (n_kv_head, rep, d)
+    w = weight.view(n_kv_head, head_dim)  # (n_kv_head, d)
+    w = w.unsqueeze(1).unsqueeze(0)  # (1, n_kv_head, 1, d)
+
+    # Norm
+    variance = x.pow(2).mean(dim=-1, keepdim=True)  # (b, s, n_kv_head, rep, 1)
+    x = x * torch.rsqrt(variance + eps) * w  # ✅ broadcast here
+
+    # Reshape back
+    x = x.view(x.shape[0], x.shape[1], n_head, head_dim)
+    return x
 
 
+
+
+def rms_norm_with_headwise_weight(x: torch.Tensor, weight: Optional[torch.Tensor], eps: float = 1e-6) -> torch.Tensor:
+    """RMSNorm that supports either per-dim weight (D,) or per-head weight (H*D,)."""
+    if weight is None:
+        return x
+    if weight.numel() == x.shape[-1]:
+        return rms_norm(x, weight=weight, eps=eps)
+
+    n_head = x.shape[-2]
+    head_dim = x.shape[-1]
+    if weight.numel() != n_head * head_dim:
+        raise ValueError(
+            f"Unsupported RMSNorm weight shape: numel={weight.numel()} expected {head_dim} or {n_head * head_dim}"
+        )
+
+    w = weight.view(n_head, head_dim)
+    variance = x.to(torch.float32).pow(2).mean(dim=-1, keepdim=True)
+    x_norm = x * torch.rsqrt(variance + eps)
+    return (x_norm * w).to(x.dtype)
 def speculate_attention_grouped(
     hidden: torch.Tensor,
     p_w_q: torch.Tensor,
@@ -189,69 +218,6 @@ def speculate_attention_grouped(
         )
 
     return prefetch_idx, pad_idx
-def rms_norm(input: torch.Tensor, weight: torch.Tensor, eps: float = 1e-6):
-    input_dtype = input.dtype
-    # 计算 RMS（Root Mean Square）
-    variance = input.to(torch.float32).pow(2).mean(dim=-1, keepdim=True)
-    # 归一化
-    hidden_states = input * torch.rsqrt(variance + eps)
-    # 缩放
-    return (weight * hidden_states).to(input_dtype)
-
-def rms_norm_gqa(x, weight, eps=1e-6):
-    """
-    RMSNorm for GQA-expanded tensor.
-    
-    Args:
-        x: (b, s, n_head, d)
-        weight: (n_kv_head * d,)  ← original GQA norm weight
-        eps: epsilon
-    
-    Returns:
-        normalized x: (b, s, n_head, d)
-    """
-    n_head = x.shape[2]
-    n_kv_head = weight.shape[0] // x.shape[3]  # weight.size = n_kv_head * d
-    assert n_head % n_kv_head == 0
-    rep = n_head // n_kv_head
-    head_dim = x.shape[3]
-
-    # Reshape x: (b, s, n_head, d) -> (b, s, n_kv_head, rep, d)
-    x = x.view(x.shape[0], x.shape[1], n_kv_head, rep, head_dim)
-
-    # Reshape weight: (n_kv_head * d,) -> (n_kv_head, 1, 1, d)
-    #                                → will broadcast to (n_kv_head, rep, d)
-    w = weight.view(n_kv_head, head_dim)  # (n_kv_head, d)
-    w = w.unsqueeze(1).unsqueeze(0)  # (1, n_kv_head, 1, d)
-
-    # Norm
-    variance = x.pow(2).mean(dim=-1, keepdim=True)  # (b, s, n_kv_head, rep, 1)
-    x = x * torch.rsqrt(variance + eps) * w  # ✅ broadcast here
-
-    # Reshape back
-    x = x.view(x.shape[0], x.shape[1], n_head, head_dim)
-    return x
-
-
-
-def rms_norm_with_headwise_weight(x: torch.Tensor, weight: Optional[torch.Tensor], eps: float = 1e-6) -> torch.Tensor:
-    """RMSNorm that supports either per-dim weight (D,) or per-head weight (H*D,)."""
-    if weight is None:
-        return x
-    if weight.numel() == x.shape[-1]:
-        return rms_norm(x, weight=weight, eps=eps)
-
-    n_head = x.shape[-2]
-    head_dim = x.shape[-1]
-    if weight.numel() != n_head * head_dim:
-        raise ValueError(
-            f"Unsupported RMSNorm weight shape: numel={weight.numel()} expected {head_dim} or {n_head * head_dim}"
-        )
-
-    w = weight.view(n_head, head_dim)
-    variance = x.to(torch.float32).pow(2).mean(dim=-1, keepdim=True)
-    x_norm = x * torch.rsqrt(variance + eps)
-    return (x_norm * w).to(x.dtype)
 def fix_recursive_import():
     global general_copy_compressed, TorchCompressedDevice, global_cpu_device
     from flexgen import compression
@@ -583,8 +549,7 @@ class TorchDevice:
     
     def init_cache_one_gpu_batch_infin(self, config, task, policy):
         num_head, hidden_size, prompt_len, gen_len, gpu_batch_size = (
-            getattr(config, "num_key_value_heads", config.num_attention_heads),
-            config.hidden_size, task.prompt_len, task.gen_len,
+            config.num_attention_heads, config.hidden_size, task.prompt_len, task.gen_len,
             policy.gpu_batch_size)
         shape = (prompt_len + gen_len - 1, gpu_batch_size * num_head, config.head_dim)
         # NOTE: disable pin_memory due to high memory overhead
@@ -1065,12 +1030,14 @@ class TorchDevice:
         if (not warmup) and (partial_weight_ratio is not None):
             partial_weight_index = partial_weight_index_generation(q, n_head, head_dim, partial_weight_ratio)
 
-        kv_head = n_head if is_mha else num_key_value_heads
-
         # Reshape: (b, s, h) -> (b, s, n_head/n_kv, head_dim)
         q = q.view(b, s, n_head, head_dim)
-        k = k.view(b, s, kv_head, head_dim)
-        v = v.view(b, s, kv_head, head_dim)
+        if is_mha:
+            k = k.view(b, s, n_head, head_dim)
+        else:
+            k = k.view(b, s, num_key_value_heads, head_dim)
+            
+        v = v.view(b, s, num_key_value_heads, head_dim)
 
         # Q/K Norm
         q = rms_norm(q, weight=q_ln, eps=eps) * scaling
@@ -1085,11 +1052,9 @@ class TorchDevice:
         q, k = apply_rotary_pos_emb(q, k, cos, sin, unsqueeze_dim=1)
 
         # GQA: repeat k/v after RoPE → (b, n_head, s, d)
-        k_base = k
-        v_base = v
         if not is_mha:
-            k = repeat_kv(k_base, num_key_value_groups)
-            v = repeat_kv(v_base, num_key_value_groups)
+            k = repeat_kv(k, num_key_value_groups)
+        v = repeat_kv(v, num_key_value_groups)
 
         # Skew mechanism during warmup
         if warmup:
@@ -1111,9 +1076,9 @@ class TorchDevice:
         if donate[0]: inputs.delete()
         if donate[1]: attention_mask.delete()
 
-        # KV Cache: (s, b * n_kv, head_dim)
-        k_cache = k_base.permute(2, 0, 1, 3).reshape(s, b * kv_head, head_dim)
-        v_cache = v_base.permute(2, 0, 1, 3).reshape(s, b * kv_head, head_dim)
+        # KV Cache: (s, b * n_head, head_dim)
+        k_cache = k.permute(2, 0, 1, 3).reshape(s, b * n_head, head_dim)
+        v_cache = v.permute(2, 0, 1, 3).reshape(s, b * n_head, head_dim)
 
         if compress_cache:
             k_cache = self.compressed_device.compress(k_cache, comp_config)
@@ -1146,23 +1111,16 @@ class TorchDevice:
         prefetch_idx = None
         if p_w_q is not None:
             with torch.cuda.stream(speculation_stream):
-                prefetch_idx = speculate_attention_gqa(
-                    hidden, p_w_q, partial_k_cache,
-                    n_head, num_key_value_heads, alpha, max_num_kv
-                )
+                prefetch_idx = speculate_attention(hidden, p_w_q, partial_k_cache, n_head, alpha, max_num_kv)
 
         # --- Normal Attention ---
         q = F.linear(hidden, w_q)
         k = F.linear(hidden, w_k)
         v = F.linear(hidden, w_v)
 
-        is_mha = (w_k.shape[0] == n_head * head_dim)
-        kv_head = n_head if is_mha else num_key_value_heads
-        rep = n_head // kv_head
-
         q = q.view(b, tgt_s, n_head, head_dim)
-        k = k.view(b, tgt_s, kv_head, head_dim)
-        v = v.view(b, tgt_s, kv_head, head_dim)
+        k = k.view(b, tgt_s, n_head, head_dim)
+        v = v.view(b, tgt_s, num_key_value_heads, head_dim)
 
         q = rms_norm(q, weight=q_ln, eps=eps) * scaling
         k = rms_norm_gqa(k, weight=k_ln, eps=eps)
@@ -1179,13 +1137,14 @@ class TorchDevice:
         cos, sin = freqs.cos(), freqs.sin()
         q, k = apply_rotary_pos_emb(q, k, cos, sin, unsqueeze_dim=1)
 
-        # GQA: keep base for cache, repeat for attention when needed
-        k_base = k
-        v_base = v
+        # GQA
+        # k_new = repeat_kv(k, num_key_value_groups)  # (b, n_head, 1, d) 
+        k_new = k
+        v_new = repeat_kv(v, num_key_value_groups) # only repeat v because of infinigen
 
-        # Reshape new k/v for cache update: (1, b * n_kv, d)
-        k_cache_new = k_base.permute(1, 0, 2, 3).reshape(tgt_s, b * kv_head, head_dim)
-        v_cache_new = v_base.permute(1, 0, 2, 3).reshape(tgt_s, b * kv_head, head_dim)
+        # Reshape new k/v for cache update: (1, b * n_head, d)
+        k_cache_new = k_new.permute(1, 0, 2, 3).reshape(tgt_s, b * n_head, head_dim)
+        v_cache_new = v_new.permute(1, 0, 2, 3).reshape(tgt_s, b * n_head, head_dim)
 
         use_sparse = (attn_topk is not None) or (attn_sparsity < 1.0)
 
@@ -1199,12 +1158,8 @@ class TorchDevice:
                     k_all = k_cache.data[:cache_len]
                     v_all = v_cache.data[:cache_len]
 
-                k_all = torch.cat([k_all, k_cache_new], dim=0)  # (cache_len+1, b * n_kv, d)
+                k_all = torch.cat([k_all, k_cache_new], dim=0)  # (cache_len+1, b * n_head, d)
                 v_all = torch.cat([v_all, v_cache_new], dim=0)
-
-                if rep > 1:
-                    k_all = repeat_kv_cache(k_all, rep, kv_head)
-                    v_all = repeat_kv_cache(v_all, rep, kv_head)
 
                 # Reshape for bmm: (b * n_head, d, s), (b * n_head, s, d)
                 k_all = k_all.permute(1, 2, 0)  # (b*n_head, d, cache_len+1)
@@ -1241,10 +1196,6 @@ class TorchDevice:
                     v_hist = torch.cat([v_base, v_cache_new], dim=0)
                     local_s = k_hist.shape[0]
                     mask = torch.ones((b, 1, 1, local_s), dtype=torch.bool, device=inputs.device)
-
-                if rep > 1:
-                    k_hist = repeat_kv_cache(k_hist, rep, kv_head)
-                    v_hist = repeat_kv_cache(v_hist, rep, kv_head)
 
                 k_all = k_hist.view(local_s, b, n_head, head_dim).permute(1, 2, 0, 3)  # (b,n_head,local_s,d)
                 v_all = v_hist.view(local_s, b, n_head, head_dim).permute(1, 2, 0, 3)
@@ -1502,9 +1453,7 @@ class TorchDevice:
                         hidden, p_w_q, partial_k_cache, n_head, num_key_value_heads, max_num_kv
                     )
                 else:
-                    prefetch_idx = speculate_attention_gqa(
-                        hidden, p_w_q, partial_k_cache, n_head, num_key_value_heads, alpha, max_num_kv
-                    )
+                    prefetch_idx = speculate_attention(hidden, p_w_q, partial_k_cache, n_head, alpha, max_num_kv)
             else:
                 with torch.cuda.stream(speculation_stream):
                     if prefetch_grouped:
@@ -1512,9 +1461,7 @@ class TorchDevice:
                             hidden, p_w_q, partial_k_cache, n_head, num_key_value_heads, max_num_kv
                         )
                     else:
-                        prefetch_idx = speculate_attention_gqa(
-                            hidden, p_w_q, partial_k_cache, n_head, num_key_value_heads, alpha, max_num_kv
-                        )
+                        prefetch_idx = speculate_attention(hidden, p_w_q, partial_k_cache, n_head, alpha, max_num_kv)
 
         # QKV projections
         q = F.linear(hidden, w_q)
@@ -1600,29 +1547,15 @@ class TorchDevice:
                 k_all = k_cache.data[:cache_len]
                 v_all = v_cache.data[:cache_len]
 
-            # If we have a full cache buffer, update in-place and only use history up to src_s.
-            # Otherwise (prefetch/sparse cache), append the current token to the local window.
-            hist_len = min(cache_len, src_s)
-            if hist_len >= src_s and hist_len > 0:
-                k_all = k_all[:hist_len]
-                v_all = v_all[:hist_len]
-                k_all[src_s - 1 : src_s] = k_cache_new
-                v_all[src_s - 1 : src_s] = v_cache_new
-                total_len = src_s
-            else:
-                if hist_len > 0:
-                    k_all = k_all[:hist_len]
-                    v_all = v_all[:hist_len]
-                k_all = torch.cat([k_all, k_cache_new], dim=0)
-                v_all = torch.cat([v_all, v_cache_new], dim=0)
-                total_len = k_all.shape[0]
+            k_all = torch.cat([k_all, k_cache_new], dim=0)
+            v_all = torch.cat([v_all, v_cache_new], dim=0)
 
             if rep > 1:
                 k_all = repeat_kv_cache(k_all, rep, kv_head)
                 v_all = repeat_kv_cache(v_all, rep, kv_head)
 
-            k_all = k_all.permute(1, 0, 2).view(b, n_head, total_len, head_dim)
-            v_all = v_all.permute(1, 0, 2).view(b, n_head, total_len, head_dim)
+            k_all = k_all.permute(1, 0, 2).view(b, n_head, cache_len + 1, head_dim)
+            v_all = v_all.permute(1, 0, 2).view(b, n_head, cache_len + 1, head_dim)
 
             value = F.scaled_dot_product_attention(
                 q, k_all, v_all,

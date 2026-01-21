@@ -433,7 +433,8 @@ class TorchDevice:
 
         b, s, h = inputs.shape
         head_dim = h // n_head
-        scaling = head_dim ** -0.5
+        # SDPA applies the scaling internally.
+        # scaling = head_dim ** -0.5
 
         hidden = F.layer_norm(inputs.data, (h,), weight=w_ln.data, bias=b_ln.data)
 
@@ -665,8 +666,6 @@ class TorchDevice:
         if k_ln is not None:
             k = rms_norm(k, weight=k_ln.data, eps=eps)
 
-        q = q * scaling
-
         q = q.transpose(1, 2)  # (b, n_head, s, d)
         k = k.transpose(1, 2)  # (b, n_kv, s, d)
         v = v.transpose(1, 2)  # (b, n_kv, s, d)
@@ -679,24 +678,25 @@ class TorchDevice:
         k = repeat_kv(k, num_key_value_groups)
         v = repeat_kv(v, num_key_value_groups)
 
-        q = q.reshape(b * n_head, s, head_dim)
-        k = k.permute(0, 1, 3, 2).reshape(b * n_head, head_dim, s)
-        v = v.reshape(b * n_head, s, head_dim)
+        # Use SDPA to avoid materializing the full attention matrix.
+        q = q.contiguous()
+        k = k.contiguous()
+        v = v.contiguous()
 
-        attn_weights = torch.bmm(q, k)
-        idx = torch.arange(s, device=self.dev)
-        causal_mask = (idx <= idx.view(s, 1)).view(1, 1, s, s)
+        causal_mask = torch.tril(
+            torch.ones((s, s), dtype=torch.bool, device=self.dev)
+        ).view(1, 1, s, s)
         if attention_mask is None:
             mask = causal_mask
         else:
             mask = attention_mask.data.view(b, 1, 1, s) & causal_mask
 
-        attn_weights = attn_weights.view(b, n_head, s, s)
-        attn_weights = torch.where(mask, attn_weights, -1e4)
-        attn_weights = attn_weights.view(b * n_head, s, s)
-        attn_weights = F.softmax(attn_weights, dim=2)
-
-        value = torch.bmm(attn_weights, v).view(b, n_head, s, head_dim)
+        value = F.scaled_dot_product_attention(
+            q, k, v,
+            attn_mask=mask,
+            dropout_p=0.0,
+            is_causal=False,
+        )
         value = value.transpose(1, 2).reshape(b, s, h)
         value = F.linear(value, w_out.data)
         value.add_(inputs.data)

@@ -30,7 +30,7 @@ from flexgen.pytorch_backend import (
 )
 from flexgen.timer import timers
 from flexgen.utils import (
-    Task, ExecutionEnv, GB, ValueHolder, cpu_mem_stats,
+    Task, ExecutionEnv, GB, ValueHolder,
     array_1d, array_2d, array_3d, str2bool,
     project_decode_latency, torch_dtype_to_np_dtype,
     write_benchmark_log
@@ -185,25 +185,10 @@ class MLP:
         x = hidden.val
         w = weight_read_buf.val
         x = rms_norm(x, w["norm_weight"], eps=self.config.rms_norm_eps)
-        # Chunk long sequences to reduce peak MLP activation memory.
-        chunk_size = int(os.environ.get("FLEXGEN_MLP_CHUNK_SIZE", "512"))
-        if x.dim() == 3 and chunk_size > 0 and x.shape[1] > chunk_size:
-            out = x if x.is_contiguous() else torch.empty_like(x)
-            for start in range(0, x.shape[1], chunk_size):
-                end = min(start + chunk_size, x.shape[1])
-                x_chunk = x[:, start:end, :]
-                gate = F.linear(x_chunk, w["gate_proj_weight"])
-                up = F.linear(x_chunk, w["up_proj_weight"])
-                up = F.silu(up, inplace=True)
-                gate.mul_(up)
-                out[:, start:end, :] = F.linear(gate, w["down_proj_weight"])
-            hidden.val = out
-            return
         gate = F.linear(x, w["gate_proj_weight"])
         up = F.linear(x, w["up_proj_weight"])
-        up = F.silu(up, inplace=True)
-        gate.mul_(up)
-        x = F.linear(gate, w["down_proj_weight"])
+        x = gate * F.silu(up)
+        x = F.linear(x, w["down_proj_weight"])
         hidden.val = x
 
 
@@ -748,11 +733,6 @@ class OptLM:
 
                     self.store_hidden(i, j, k)
                     self.store_cache(i, j, k, overlap=False)
-                    if j > 0:
-                        # Free previous layer activations to reduce peak memory.
-                        self.hidden[i][j - 1][k].val = None
-                    if j == self.num_layers - 1:
-                        self.hidden[i][j][k].val = None
 
                     # schedule prefetch after attention layer decoding
                     if (j in self.attn_layer[1:-1]) and (i > 0):
@@ -761,7 +741,6 @@ class OptLM:
 
             timers("generate").stop()
 
-    @torch.no_grad()
     def generate(
         self,
         inputs: Union[np.ndarray, List[List[int]]],
@@ -849,32 +828,6 @@ def get_filename(args):
     return filename
 
 
-def get_device_mem_stats(device):
-    if hasattr(device, "mem_stats"):
-        return device.mem_stats()
-    if getattr(device, "device_type", None) == DeviceType.CUDA:
-        cur_mem = torch.cuda.memory_allocated(device.dev)
-        peak_mem = torch.cuda.max_memory_allocated(device.dev)
-    elif getattr(device, "device_type", None) == DeviceType.CPU:
-        cur_mem = cpu_mem_stats()
-        peak_mem = 0
-    else:
-        cur_mem = 0
-        peak_mem = 0
-    return cur_mem, peak_mem
-
-
-def print_device_stats(device):
-    if hasattr(device, "print_stats"):
-        return device.print_stats()
-    cur_mem, peak_mem = get_device_mem_stats(device)
-    name = getattr(device, "name", str(device))
-    print(f"TorchDevice: {name}")
-    print(f"  cur_mem: {cur_mem/GB:.4f} GB, "
-          f" peak_mem: {peak_mem/GB:.4f} GB")
-    return cur_mem, peak_mem
-
-
 def run_flexgen(args):
     print(f"<run_SparsePool>: args.model={args.model}, path={args.path}", flush=True)
 
@@ -955,8 +908,8 @@ def run_flexgen(args):
     decode_throughput = num_prompts * (args.gen_len - 1) / max(decode_latency, 1e-10)
     total_latency = prefill_latency + decode_latency
     total_throughput = (num_prompts * args.gen_len) / total_latency
-    _, gpu_peak_mem = get_device_mem_stats(gpu)
-    _, cpu_peak_mem = get_device_mem_stats(cpu)
+    _, gpu_peak_mem = gpu.mem_stats()
+    _, cpu_peak_mem = cpu.mem_stats()
 
     if DUMMY_WEIGHT not in args.path:
         outputs = tokenizer.batch_decode(output_ids, skip_special_tokens=True)
@@ -966,8 +919,8 @@ def run_flexgen(args):
                 print(f"{i}: {outputs[i]}")
                 print(70 * "-")
 
-    print_device_stats(gpu)
-    print_device_stats(cpu)
+    gpu.print_stats()
+    cpu.print_stats()
 
     filename = get_filename(args) + ".log" if args.log_file == "auto" else args.log_file
     log_str = write_benchmark_log(

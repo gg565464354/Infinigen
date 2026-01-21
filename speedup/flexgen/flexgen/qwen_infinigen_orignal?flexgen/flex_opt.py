@@ -18,7 +18,7 @@ from transformers import AutoTokenizer, Qwen3Config
 from safetensors.torch import load_file
 
 from flexgen.compression import CompressionConfig
-from flexgen.original_qwen.pytorch_backend import (TorchDevice, TorchDisk, TorchLink,
+from flexgen.pytorch_backend import (TorchDevice, TorchDisk, TorchLink,
     TorchMixedDevice, DeviceType, general_copy, fix_recursive_import)
 from flexgen.timer import timers
 from flexgen.utils import (Task, ExecutionEnv, GB, T, ValueHolder,
