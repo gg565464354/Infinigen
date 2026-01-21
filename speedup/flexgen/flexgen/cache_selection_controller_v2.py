@@ -281,8 +281,21 @@ class CacheManager:
         group_final_v = []
 
         # Step 1: 获取未命中KV
+        if prefetch_idx is None or prefetch_idx.numel() == 0 or prefetch_idx.shape[0] == 0:
+            # No tokens to prefetch; return cached KV with empty unhit tensors.
+            for i in range(len(group_cached_gpu_k)):
+                cached_k = group_cached_gpu_k[i]
+                empty_shape = (0, cached_k.shape[1], cached_k.shape[2])
+                empty_k = torch.empty(empty_shape, device=cached_k.device, dtype=cached_k.dtype)
+                empty_v = torch.empty(empty_shape, device=cached_k.device, dtype=cached_k.dtype)
+                group_final_k.append((cached_k, empty_k))
+                group_final_v.append((group_cached_gpu_v[i], empty_v))
+            return group_final_k, group_final_v, []
+
         prefetch_idx_int = prefetch_idx.squeeze(1).to(torch.int32)
-        pad_idx_list = prefetch_idx[0][0].tolist()
+        if pad_idx is None:
+            pad_idx = torch.zeros((1, 1, prefetch_idx.shape[2]), dtype=torch.int32)
+        pad_idx_list = pad_idx[0][0].int().tolist()
         group_unhit = cur_cache.get_unhit_kv_tensor_v7(
             prefetch_idx_int, 
             pad_idx_list,
@@ -634,7 +647,8 @@ def unhit_map_to_padded_idx(unhit_map):
     if max_n == 0:
         return torch.zeros((0, 1, bh), dtype=torch.long, device=device), lengths
 
-    _, sorted_indices = torch.sort(unhit_map.logical_not(), dim=1, stable=True)
+    sort_keys = unhit_map.logical_not().to(torch.int32)
+    _, sorted_indices = torch.sort(sort_keys, dim=1, stable=True)
     sorted_vals = torch.gather(indices, 1, sorted_indices)
     padded = sorted_vals[:, :max_n]
     padded_idx = padded.t().unsqueeze(1).int()
