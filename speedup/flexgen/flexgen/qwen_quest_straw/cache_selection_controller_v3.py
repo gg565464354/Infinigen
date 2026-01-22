@@ -52,7 +52,7 @@ class CacheManager:
         self._update_recode = {}
 
         # tmp change 
-        update_pred = 6
+        update_pred = 4
         self._update_pred = update_pred
         
         self._basic_group_head_ids = basic_group_head_ids # key: layer_id, value: layer group head ids
@@ -137,6 +137,13 @@ class CacheManager:
         if layer_id in self._caches:
             raise ValueError("Python ERROR! [add_cache] layer id is used!")
             return 1
+
+        new_cache, new_class_group_id = self.create_cache_instance(
+            device, layer_id, batch_size, head_num, sparse_len, hidden_size
+        )
+
+        self._caches[layer_id] = new_cache
+        self._cur_group_ids[layer_id] = new_class_group_id
         
         # print(f"Cache Manager add cache Layer #{layer_id}", flush=True)
         # print_gpu_memory()
@@ -206,12 +213,43 @@ class CacheManager:
     def get_layer_cache(self, layer_id):
         return self._caches[layer_id]
     
+#     def cache_miss_check(self, layer_id, prefetch_idx):
+#         '''
+#             return original prefetch_idx, but generate unhit map
+#         '''
+#         # if require update, directly return prefetch_idx
+#         if self._require_update[layer_id]:
+#             return prefetch_idx
+        
+        
+#         # print(f"cache_miss_check: Layer#{layer_id} reach illegal", flush=True)
+#         assert self.max_token_len != 0, "Cachemanager cache_miss_check Error! max_token_len is Zero."
+        
+#         W_cache = self.layer_cache_maps[layer_id]
+        
+#         W_sparse_gpu = build_sparse_map(prefetch_idx, self.max_token_len, device='cuda')
+#         W_unhit_gpu = cache_miss_detection(W_cache, W_sparse_gpu)
+#         lengths = W_unhit_gpu.sum(dim=1)
+        
+#         # print(f"cache_miss_check: Layer #{layer_id} unhit lengths = {lengths}", flush=True)
+        
+#         self.layer_unhit_lengths[layer_id] = lengths.cpu()
+#         self.layer_unhit_maps[layer_id] = W_unhit_gpu.cpu()
+#         self.layer_sparse_maps[layer_id] = W_sparse_gpu
+        
+#         # update cache map (only for gpu cache)
+#         if self._use_gpu_cache[layer_id]:
+#             update_cache_map_(W_cache, W_sparse_gpu)
+        
+#         return prefetch_idx
+
     def cache_miss_check(self, layer_id, prefetch_idx):
         '''
             return original prefetch_idx, but generate unhit map
         '''
         # if require update, directly return prefetch_idx
         if self._require_update[layer_id]:
+            # print(f"cache_miss_check: Layer#{layer_id} here?", flush=True)
             return prefetch_idx
         
         
@@ -231,7 +269,8 @@ class CacheManager:
         unhit_idx_gpu, lengths = unhit_map_to_padded_idx(W_unhit_gpu)
         unhit_idx_cpu = unhit_idx_gpu.cpu()
         
-        # print(f"cache_miss_check: Layer #{layer_id} unhit lengths = {lengths}", flush=True)
+        
+        print(f"cache_miss_check: Layer #{layer_id} unhit lengths = {lengths}", flush=True)
         
         self.layer_unhit_lengths[layer_id] = lengths.cpu()
         self.layer_unhit_maps[layer_id] = W_unhit_gpu.cpu()
@@ -239,8 +278,9 @@ class CacheManager:
         self.layer_sparse_maps[layer_id] = W_sparse_gpu
         
         # update cache map (only for gpu cache)
-        if self._use_gpu_cache[layer_id]:
-            update_cache_map_(W_cache, W_sparse_gpu)
+        # update_cache_map_(W_cache, W_sparse_gpu)
+        # if self._use_gpu_cache[layer_id]:
+        update_cache_map_(W_cache, W_sparse_gpu)
         
         return unhit_idx_cpu
 
@@ -274,6 +314,12 @@ class CacheManager:
             group_cached_gpu_k = [k.cuda(non_blocking=True) for k in group_cached_k]
             group_cached_gpu_v = [v.cuda(non_blocking=True) for v in group_cached_v]
         
+            # Step 3: 等待 CPU 计算结束
+            # try:
+            #     pad_unhit_id_map = future_unhit.result()
+            # except Exception as e:
+            #     print(f"CPU Cache load select_kv_tensor_with_pad error: {e}")
+
             _C.select_kv_tensor_with_pad(
                 cur_unhit_idx,
                 cur_unhit_length_list,
@@ -350,6 +396,89 @@ class CacheManager:
         
         
     
+#     def gpu_cache_load(self, layer_id, transfer_stream, unhit_idx, pad_idx, all_k, all_v, dtype):
+#         '''
+#             prefetch_idx (n', 1, bh)
+#             pad_idx (1, 1, bh)
+#         '''
+        
+#         # print("################################# gpu_load Layer #", layer_id)
+#         # # print(f"Layer #{layer_id} use gpu_cache_load")
+#         # print_gpu_memory()
+        
+#         # step0: get layer cache context
+#         cur_cache_map = self.layer_cache_maps[layer_id]
+#         cur_unhit_map = self.layer_unhit_maps[layer_id].cpu()
+#         # cur_unhit_idx = unhit_idx.cpu()
+#         cur_pad_idx = pad_idx.cpu()
+#         cur_unhit_length = self.layer_unhit_lengths[layer_id]
+#         cur_sparse_maps = self.layer_sparse_maps[layer_id]
+        
+#         group_cached_gpu_k, group_cached_gpu_v = self._gpu_cached_group_kv[layer_id]
+        
+#         # step1: build unhit tensor (maybe we should use cpp module)
+#         bh = unhit_idx.shape[-1]
+        
+        
+#         # our select: use cpu module to get 
+#         cur_pad_idx_list = cur_pad_idx[0][0].int().tolist()
+#         cur_unhit_length_list = cur_unhit_length.int().tolist()
+#         max_unhit_len = max(cur_unhit_length_list)
+#         unhit_total_len = sum(cur_unhit_length_list)
+        
+#         # print(f"Layer #{layer_id} cur_unhit_length = {cur_unhit_length}", flush=True)
+#         # print(f"Layer #{layer_id} cur_unhit_length_list = {cur_unhit_length_list}", flush=True)
+        
+#         pad_len = 1
+#         pad_unhit_id_map = _C.select_kv_from_unhit_map_with_lengths(
+#             cur_unhit_map, 
+#             cur_unhit_length_list, 
+#             all_k, 
+#             all_v, 
+#             self._pinned_flat_unhit_k[1:1+unhit_total_len], 
+#             self._pinned_flat_unhit_v[1:1+unhit_total_len]
+#         )
+#         self._pinned_flat_unhit_k[0] = 0
+#         self._pinned_flat_unhit_v[0] = 0
+
+        
+#         # Step 2: manage as group
+#         tmp_unhit_k = self._pinned_flat_unhit_k[:unhit_total_len+pad_len, :]
+#         tmp_unhit_v = self._pinned_flat_unhit_v[:unhit_total_len+pad_len, :]
+#         flat_unhit_k = tmp_unhit_k
+#         flat_unhit_v = tmp_unhit_v
+            
+#         # Step 3: unhit_k/v -> GPU 
+#         with torch.cuda.stream(transfer_stream):
+#             unhit_gpu_k = flat_unhit_k.cuda(non_blocking=True)
+#             unhit_gpu_v = flat_unhit_v.cuda(non_blocking=True)
+
+#             # for i in range(len(group_cached_gpu_k)):
+#             group_final_k = [(group_cached_gpu_k[0], unhit_gpu_k)]
+#             group_final_v = [(group_cached_gpu_v[0], unhit_gpu_v)]
+            
+#             # pad id list to map, use the index of the last k/v vector as padding id
+#             unhit_kv_map = pad_unhit_id_map.cuda()
+
+        
+#         # print("max_unhit_len =", max_unhit_len)
+#         # print("pad_unhit_id_map shape =", pad_unhit_id_map.shape)
+#         # group_cache_shape = [unhit.shape for unhit in group_cached_gpu_k]
+#         # print("group_cache_shape = ", group_cache_shape)
+#         # group_unhit_shape = [flat_unhit_k.shape]
+#         # print("group_unhit_shape = ", group_unhit_shape)
+        
+        
+#         # step4: 判断是否需要更新
+#         cur_cache_len = group_cached_gpu_k[0].shape[0]
+#         # 如果剩余cache空间足够，更新cache
+#         if self._max_gpu_cached_len < (cur_cache_len + max_unhit_len):
+#             # print(f"require update = True, _max_cached_len={self._max_gpu_cached_len} cur_cache_len={cur_cache_len} max_unhit_len={max_unhit_len}", flush = True)
+#             self._require_update[layer_id] = True
+
+
+#         return group_final_k, group_final_v, unhit_kv_map
+    
     def gpu_cache_load(self, layer_id, transfer_stream, unhit_idx, pad_idx, all_k, all_v, dtype):
         '''
             prefetch_idx (n', 1, bh)
@@ -357,10 +486,10 @@ class CacheManager:
         '''
         
         # print("################################# gpu_load Layer #", layer_id)
-        # # print(f"Layer #{layer_id} use gpu_cache_load")
-        # print_gpu_memory()
+        # print(f"Layer #{layer_id} use gpu_cache_load")
         
         # step0: get layer cache context
+        cur_cache_map = self.layer_cache_maps[layer_id]
         cur_unhit_idx = unhit_idx.cpu()
         cur_pad_idx = pad_idx.cpu()
         cur_unhit_length = self.layer_unhit_lengths[layer_id]
@@ -372,7 +501,9 @@ class CacheManager:
         bh = unhit_idx.shape[-1]
         max_unhit_len = unhit_idx.shape[0]
         
-        # our select: use cpu module to get 
+        
+        # oor select: use cpu module to get 
+        
         cur_pad_idx_list = cur_pad_idx[0][0].int().tolist()
         cur_unhit_length_list = cur_unhit_length.int().tolist()
         
@@ -386,11 +517,16 @@ class CacheManager:
             self._pinned_unhit_v_list[0]
         )
         
+        # print("select_kv_tensor_with_pad success?", flush=True)
+        
+        
         # Step 2: manage as group
         tmp_unhit_k = self._pinned_unhit_k_list[0][:max_unhit_len, :, :]
         tmp_unhit_v = self._pinned_unhit_v_list[0][:max_unhit_len, :, :]
         group_unhit_k = [tmp_unhit_k]
         group_unhit_v = [tmp_unhit_v]
+        
+        
             
         # Step 3: unhit_k/v -> GPU 
         with torch.cuda.stream(transfer_stream):
@@ -400,26 +536,16 @@ class CacheManager:
             # for i in range(len(group_cached_gpu_k)):
             group_final_k = [(group_cached_gpu_k[0], unhit_gpu_k[0])]
             group_final_v = [(group_cached_gpu_v[0], unhit_gpu_v[0])]
-
         
-        # print("max_unhit_len =", max_unhit_len)
-        # print("pad_unhit_id_map shape =", pad_unhit_id_map.shape)
-        # group_cache_shape = [unhit.shape for unhit in group_cached_gpu_k]
-        # print("group_cache_shape = ", group_cache_shape)
-        # group_unhit_shape = [flat_unhit_k.shape]
-        # print("group_unhit_shape = ", group_unhit_shape)
+#         print("unhit_idx shape =", unhit_idx.shape)
+#         group_cache_shape = [unhit.shape for unhit in group_cached_gpu_k]
+#         print("group_cache_shape = ", group_cache_shape)
+#         group_unhit_shape = [unhit.shape for unhit in group_unhit_k]
+#         print("group_unhit_shape = ", group_unhit_shape)
         
-        
-        # step4: 判断是否需要更新
-        cur_cache_len = group_cached_gpu_k[0].shape[0]
-        # 如果剩余cache空间足够，更新cache
-        if self._max_gpu_cached_len < (cur_cache_len + max_unhit_len):
-            # print(f"require update = True, _max_cached_len={self._max_gpu_cached_len} cur_cache_len={cur_cache_len} max_unhit_len={max_unhit_len}", flush = True)
-            self._require_update[layer_id] = True
 
 
         return group_final_k, group_final_v, None
-
  
     
     def load_and_update_gpu_cached(self, layer_id, transfer_stream, prefetch_idx, all_k, all_v, dtype):
@@ -530,6 +656,36 @@ class CacheManager:
         
 
         return group_gpu_k, group_gpu_v, group_cpu_k, group_cpu_v
+
+    def generate_class_group_ids(self, layer_id, batch_size):
+        cur_basic_head_ids = self._basic_group_head_ids[layer_id]
+        cur_head_num = self.layer_head_number
+        final_head_ids = [[] for _ in range(len(cur_basic_head_ids))]
+
+        for b in range(batch_size):
+            for g in range(len(cur_basic_head_ids)):
+                for head_id in cur_basic_head_ids[g]:
+                    final_head_ids[g].append(head_id + b * cur_head_num)
+
+        return final_head_ids
+
+    def create_cache_instance(self, device, layer_id, batch_size, head_num, sparse_len, hidden_size=128):
+        if len(self._basic_group_head_ids) == 0:
+            raise ValueError("Python ERROR! [create_cache_instance] basic_group_ids was not initialed!")
+
+        new_class_group_id = self.generate_class_group_ids(layer_id, batch_size)
+        new_class_group_id_tensor = [
+            torch.tensor(head_id_list, dtype=torch.int32).to(device)
+            for head_id_list in new_class_group_id
+        ]
+
+        bh = batch_size * head_num
+        cache_shape = (bh, sparse_len, hidden_size)
+        cache_idx = torch.randint(low=0, high=sparse_len, size=(sparse_len, 1, batch_size * head_num)).to(torch.int32)
+
+        cache = _C.CPUCache(bh, cache_idx, cache_shape, new_class_group_id)
+
+        return cache, new_class_group_id_tensor
     
 
     def update_gpu_cache_with_new_tensor(self, layer_id, new_k_cache, new_v_cache):
@@ -548,7 +704,7 @@ class CacheManager:
 
 
     # 统一的更新和加载接口
-    def unified_load_api(self, layer_id, transfer_stream, unhit_idx, pad_idx, all_k, all_v, dtype):
+    def unified_load_api(self, layer_id, transfer_stream, prefetch_idx, pad_idx, all_k, all_v, dtype):
         if self._use_gpu_cache[layer_id]:
             # 判断是否需要更新
             if self._require_update[layer_id]:
@@ -556,17 +712,22 @@ class CacheManager:
                 self._update_recode[layer_id] = 0
                 self._require_update[layer_id] = False
                 
-                group_gpu_k, group_gpu_v, group_cpu_k, group_cpu_v = self.load_and_update_gpu_cached(layer_id, transfer_stream, unhit_idx, all_k, all_v, dtype)
+                group_gpu_k, group_gpu_v, group_cpu_k, group_cpu_v = self.load_and_update_gpu_cached(
+                    layer_id, transfer_stream, prefetch_idx, all_k, all_v, dtype
+                )
                 
                 return (group_gpu_k, group_gpu_v, None)
             else:
                 self._update_recode[layer_id] += 1
                 
                 # version 3
-                group_final_k, group_final_v, unhit_id_map = self.gpu_cache_load(layer_id, transfer_stream, unhit_idx, pad_idx, all_k, all_v, dtype)
-                
-                # if self._update_recode[layer_id] > self._update_pred:
-                #     self._require_update[layer_id] = True
+                unhit_idx = self.cache_miss_check(layer_id, prefetch_idx)
+                group_final_k, group_final_v, unhit_id_map = self.gpu_cache_load(
+                    layer_id, transfer_stream, unhit_idx, pad_idx, all_k, all_v, dtype
+                )
+                # 静态更新
+                if self._update_recode[layer_id] > self._update_pred:
+                    self._require_update[layer_id] = True
                 
                 return (group_final_k, group_final_v, unhit_id_map)
         else:
@@ -575,14 +736,19 @@ class CacheManager:
                 # 直接更新cache
                 self._update_recode[layer_id] = 1
                 self._require_update[layer_id] = False
-                group_gpu_k, group_gpu_v, group_cpu_k, group_cpu_v = self.load_and_update_cpu_cache(layer_id, transfer_stream, unhit_idx, all_k, all_v, dtype)
+                group_gpu_k, group_gpu_v, group_cpu_k, group_cpu_v = self.load_and_update_cpu_cache(
+                    layer_id, transfer_stream, prefetch_idx, all_k, all_v, dtype
+                )
                 
                 return (group_gpu_k, group_gpu_v, None)
             else:
                 
                 self._update_recode[layer_id] += 1
                 
-                group_final_k, group_final_v, unhit_id_map = self.cpu_cache_load(layer_id, transfer_stream, unhit_idx, pad_idx, all_k, all_v, dtype)
+                unhit_idx = self.cache_miss_check(layer_id, prefetch_idx)
+                group_final_k, group_final_v, unhit_id_map = self.cpu_cache_load(
+                    layer_id, transfer_stream, unhit_idx, pad_idx, all_k, all_v, dtype
+                )
                 
                 if self._update_recode[layer_id] > self._update_pred:
                     self._require_update[layer_id] = True
@@ -693,7 +859,7 @@ def update_cache_map_(W_cache, W_sparse):
 def unhit_map_to_padded_idx(unhit_map):
     """
     输入: unhit_map (BH, T), bool, on GPU
-    输出: padded_idx (max_n, 1, BH), long, on GPU, padding 0
+    输出: padded_idx (max_n, 1, BH), int32, on GPU, padding 0
     """
     BH, T = unhit_map.shape
     device = unhit_map.device
@@ -707,7 +873,7 @@ def unhit_map_to_padded_idx(unhit_map):
     lengths = unhit_map.sum(dim=1)  # (BH,)
     max_n = lengths.max().item()
     if max_n == 0:
-        return torch.zeros((0, 1, BH), dtype=torch.long, device=device), lengths
+        return torch.zeros((0, 1, BH), dtype=union_dtype, device=device), lengths
 
     # 排序：将有效值移到前面
     # 使用 stable sort 保证顺序

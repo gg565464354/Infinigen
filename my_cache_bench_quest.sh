@@ -4,8 +4,8 @@
 # 设置要测试的 gpu-batch-size 值列表
 # batch_sizes=(24 25 26 27 28 29 30 31 32)
 # batch_sizes=(12 13 14 15 16)
-batch_sizes=2
-# batch_sizes=(8)
+# batch_sizes=2
+batch_sizes=(1 2 3 4 5 6)
 prompt_len=8196
 max_kv=2048
 gen_len=512
