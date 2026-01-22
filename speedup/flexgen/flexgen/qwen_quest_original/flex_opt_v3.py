@@ -320,8 +320,11 @@ class SelfAttention:
         cache_home.store((k_cache, v_cache))
         if self.layer_id > 1:
             cache_dtype = k_cache.dtype if hasattr(k_cache, "dtype") else self.config.torch_dtype
+            real_max_num_kv = self.max_num_kv
+            if self.prefetch_algo == "quest":
+                real_max_num_kv = max(real_max_num_kv, (self.quest_topk + 1) * self.quest_page_size)
             self.prefetch_kv = device.allocate(
-                (2, self.max_num_kv, k_cache.shape[1], k_cache.shape[2]),
+                (2, real_max_num_kv, k_cache.shape[1], k_cache.shape[2]),
                 cache_dtype,
                 pin_memory=True,
             )
@@ -350,6 +353,14 @@ class SelfAttention:
 
         L = int(real_prefetch_idx.shape[0])
         indices = (slice(0, L), slice(0, k_home.shape[1]))
+
+        if self.prefetch_kv is None or L > self.prefetch_kv.shape[1]:
+            cache_dtype = k_home.dtype if hasattr(k_home, "dtype") else self.config.torch_dtype
+            self.prefetch_kv = k_home.device.allocate(
+                (2, L, k_home.shape[1], k_home.shape[2]),
+                cache_dtype,
+                pin_memory=True,
+            )
 
         self.prefetch_kv.data[0, :L], self.prefetch_kv.data[1, :L] = select_kv(
             real_prefetch_idx, k_home.data, v_home.data

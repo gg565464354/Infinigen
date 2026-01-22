@@ -549,7 +549,8 @@ class TorchDevice:
     
     def init_cache_one_gpu_batch_infin(self, config, task, policy):
         num_head, hidden_size, prompt_len, gen_len, gpu_batch_size = (
-            config.num_attention_heads, config.hidden_size, task.prompt_len, task.gen_len,
+            getattr(config, "num_key_value_heads", config.num_attention_heads),
+            config.hidden_size, task.prompt_len, task.gen_len,
             policy.gpu_batch_size)
         shape = (prompt_len + gen_len - 1, gpu_batch_size * num_head, config.head_dim)
         # NOTE: disable pin_memory due to high memory overhead
@@ -1547,6 +1548,15 @@ class TorchDevice:
                 k_all = k_cache.data[:cache_len]
                 v_all = v_cache.data[:cache_len]
 
+            # Align cache width with new KV heads (some caches are allocated with full attention heads).
+            if k_all.shape[1] != k_cache_new.shape[1]:
+                if k_all.shape[1] > k_cache_new.shape[1]:
+                    k_all = k_all[:, :k_cache_new.shape[1], :]
+                    v_all = v_all[:, :k_cache_new.shape[1], :]
+                else:
+                    k_cache_new = k_cache_new[:, :k_all.shape[1], :]
+                    v_cache_new = v_cache_new[:, :v_all.shape[1], :]
+
             k_all = torch.cat([k_all, k_cache_new], dim=0)
             v_all = torch.cat([v_all, v_cache_new], dim=0)
 
@@ -1572,6 +1582,15 @@ class TorchDevice:
             else:
                 k_base = k_cache.data
                 v_base = v_cache.data
+
+            # Align cache width with new KV heads (some caches are allocated with full attention heads).
+            if k_base.shape[1] != k_cache_new.shape[1]:
+                if k_base.shape[1] > k_cache_new.shape[1]:
+                    k_base = k_base[:, :k_cache_new.shape[1], :]
+                    v_base = v_base[:, :k_cache_new.shape[1], :]
+                else:
+                    k_cache_new = k_cache_new[:, :k_base.shape[1], :]
+                    v_cache_new = v_cache_new[:, :v_base.shape[1], :]
 
             if k_base.shape[0] >= src_s:
                 k_hist = k_base[:src_s]
