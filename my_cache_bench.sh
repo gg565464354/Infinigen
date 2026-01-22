@@ -8,7 +8,7 @@ batch_sizes=1
 # batch_sizes=(1 2 3 4 5 6)
 prompt_len=8196
 max_kv=2048
-gen_len=10
+gen_len=512
 
 # gpu_cache_num=30
 gpu_cache_num=0
