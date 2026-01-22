@@ -26,7 +26,7 @@ from flexgen.compression import CompressionConfig
 from flexgen.opt_config import OptConfig, get_opt_config
 from flexgen.pytorch_backend import (
     TorchDevice, TorchDisk, TorchMixedDevice, DeviceType,
-    general_copy, fix_recursive_import, TorchTensor, _get_cache_torch_dtype
+    general_copy, fix_recursive_import, TorchTensor
 )
 from flexgen.timer import timers
 from flexgen.utils import (
@@ -649,8 +649,7 @@ class OptLM:
 
         self.head_num = getattr(self.config, "num_key_value_heads", self.config.num_attention_heads)
         self.head_dim = getattr(self.config, "head_dim", self.config.hidden_size // self.config.num_attention_heads)
-        # cache_dtype = _get_cache_torch_dtype(config)
-        cache_dtype = self.config.torch_dtype
+        cache_dtype = config.torch_dtype
 
         original_head_group_ids = {}
         for l in range(self.config.num_hidden_layers):

@@ -90,7 +90,7 @@ def _get_cache_torch_dtype(config) -> torch.dtype:
     """
     dtype = _get_config_torch_dtype(config)
     if dtype == torch.bfloat16:
-        return torch.bfloat16
+        return torch.float16
     return dtype
 
 
