@@ -39,7 +39,8 @@ from flexgen.utils import (
 from infinigen.partial_weight_generation_controller import (
     set_partial_cache_gqa, set_partial_weight
 )
-from flexgen.cache_selection_controller_v2 import CacheManager
+from flexgen.cache_selection_controller_v2 import CacheManager, reconstruct_unhit_only_on_gpu
+from quest.quest_sparse import QuestSparsePageSelector
 
 from safetensors.torch import load_file
 
@@ -99,7 +100,8 @@ class InputEmbed:
         self.compute = env.gpu
         self.task = None
 
-    def set_task(self, task): self.task = task
+    def set_task(self, task):
+        self.task = task
 
     def init_weight(self, weight_home, state_dict=None, layer_id=None):
         if state_dict is None:
@@ -186,9 +188,9 @@ class MLP:
         w = weight_read_buf.val
         x = rms_norm(x, w["norm_weight"], eps=self.config.rms_norm_eps)
         # Chunk long sequences to reduce peak MLP activation memory.
-        chunk_size = int(os.environ.get("FLEXGEN_MLP_CHUNK_SIZE", "1024"))
+        chunk_size = int(os.environ.get("FLEXGEN_MLP_CHUNK_SIZE", "512"))
         if x.dim() == 3 and chunk_size > 0 and x.shape[1] > chunk_size:
-            out = torch.empty_like(x)
+            out = x if x.is_contiguous() else torch.empty_like(x)
             for start in range(0, x.shape[1], chunk_size):
                 end = min(start + chunk_size, x.shape[1])
                 x_chunk = x[:, start:end, :]
@@ -218,7 +220,8 @@ class SelfAttention:
     def __init__(
         self, config, env, policy, layer_id, cache_manager,
         enable_prefetching: bool,
-        partial_weight_ratio=0.2, alpha=4, max_num_kv=400
+        partial_weight_ratio=0.2, alpha=4, max_num_kv=400,
+        prefetch_algo: str = "infinigen",
     ):
         self.config = config
         self.env = env
@@ -231,11 +234,14 @@ class SelfAttention:
         self.task = None
         self.enable_prefetching = enable_prefetching
         self.prefetch_idx = None
+        self.prefetch_algo = prefetch_algo
 
         self.partial_index = None
         self.alpha = alpha
         self.max_num_kv = max_num_kv
-        self.partial_weight_ratio = partial_weight_ratio if layer_id > 1 else None
+        self.partial_weight_ratio = (
+            partial_weight_ratio if (self.prefetch_algo == "infinigen" and layer_id > 1) else None
+        )
 
         self.prefetch_kv = None  # temp buffer
 
@@ -249,7 +255,34 @@ class SelfAttention:
         self._cache_manager = cache_manager
         self._debug_logged = False
 
-    def set_task(self, task): self.task = task
+        # CacheManager returns unhit in a flattened buffer; keep the map here for decode reconstruction.
+        self.unhit_id_map = None
+
+        # Quest selector (initialized after task is known)
+        self.quest_selector = None
+        self.quest_page_size = 16
+        self.quest_topk = int((max_num_kv // self.quest_page_size) + 1)
+        if self.prefetch_algo not in ("infinigen", "quest"):
+            raise ValueError(f"Unknown prefetch_algo: {self.prefetch_algo}")
+
+    def set_task(self, task):
+        self.task = task
+        self.prefetch_idx = None
+        self.unhit_id_map = None
+
+        if self.prefetch_algo == "quest" and self.enable_prefetching:
+            max_seq_len = task.prompt_len + task.gen_len
+            self.quest_selector = QuestSparsePageSelector(
+                batch_size=self.policy.gpu_batch_size,
+                max_seq_len=max_seq_len,
+                num_heads=self.num_key_value_heads,
+                head_dim=self.head_dim,
+                page_size=self.quest_page_size,
+                dtype=self.config.torch_dtype,
+                device=str(self.compute.dev),
+            )
+        else:
+            self.quest_selector = None
 
     def init_weight(self, weight_home, state_dict=None, layer_id=None):
         if state_dict is None:
@@ -351,6 +384,7 @@ class SelfAttention:
                 k_data = k_home.data
                 v_data = v_home.data
                 cache_dtype = k_home.dtype
+                # Avoid expensive full-cache dtype conversion unless CacheManager is configured for fp16.
                 if (
                     isinstance(k_data, torch.Tensor)
                     and k_data.dtype == torch.bfloat16
@@ -359,10 +393,12 @@ class SelfAttention:
                     k_data = k_data.to(torch.float16)
                     v_data = v_data.to(torch.float16)
                     cache_dtype = torch.float16
+
                 group_gpu_k, group_gpu_v, group_unhit = self._cache_manager.unified_load_api(
                     self.layer_id, prefetch_cache_stream, prefetch_idx_int, pad_idx_int,
                     k_data, v_data, cache_dtype
                 )
+                self.unhit_id_map = group_unhit
 
                 cache_read_buf.store(
                     ((group_gpu_k, True),
@@ -437,7 +473,7 @@ class SelfAttention:
             cache_write_buf.store((new_k_cache, new_v_cache))
 
             # store partial into "prev" buffers (pipeline design)
-            if (prev_partial_cache_read_buf is not None) and (not warmup):
+            if (self.prefetch_algo == "infinigen") and (prev_partial_cache_read_buf is not None) and (not warmup):
                 prev_partial_cache_read_buf.store(
                     set_partial_cache_gqa(
                         new_k_cache.data, self.partial_index, n_head,
@@ -451,55 +487,109 @@ class SelfAttention:
                 weights["q_proj_weight"] = w_q_upd
                 weights["k_proj_weight"] = w_k_upd
 
+            # Quest selector summary update (use kv-head cache)
+            if self.prefetch_algo == "quest" and self.quest_selector is not None and (not warmup):
+                self.quest_selector.append_prefill_kv(new_k_cache.data)
+
             hidden.val = h_out.data
             return
 
         # Decode
         (k_cache_buf, _), (v_cache_buf, _) = cache_read_buf.pop()
 
-        def _merge_group_cache(group_cache):
-            if isinstance(group_cache, (list, tuple)):
-                tensors = []
-                for item in group_cache:
-                    if isinstance(item, (list, tuple)):
-                        tensors.extend(item)
-                    else:
-                        tensors.append(item)
-                if len(tensors) == 1:
-                    return tensors[0]
-                tensors = [t.data if isinstance(t, TorchTensor) else t for t in tensors]
-                return torch.cat(tensors, dim=0)
-            return group_cache
+        # cache_read_buf holds either:
+        # - full cache (TorchTensor) from load_cache()
+        # - grouped cache from CacheManager.unified_load_api(): [(cached_k, flat_unhit_k)]
+        if isinstance(k_cache_buf, list):
+            if len(k_cache_buf) == 0:
+                raise ValueError("Empty cache buffer")
 
-        k_cache_buf = _merge_group_cache(k_cache_buf)
-        v_cache_buf = _merge_group_cache(v_cache_buf)
+            if isinstance(k_cache_buf[0], tuple):
+                cache_k, flat_unhit_k = k_cache_buf[0]
+                cache_v, flat_unhit_v = v_cache_buf[0]
+
+                if (self.unhit_id_map is not None) and isinstance(self.unhit_id_map, torch.Tensor):
+                    unhit_k = reconstruct_unhit_only_on_gpu(
+                        unhit_id_map_gpu=self.unhit_id_map,
+                        global_unhit_kv_gpu=flat_unhit_k,
+                        head_dim=head_dim,
+                        device=flat_unhit_k.device,
+                    )
+                    unhit_v = reconstruct_unhit_only_on_gpu(
+                        unhit_id_map_gpu=self.unhit_id_map,
+                        global_unhit_kv_gpu=flat_unhit_v,
+                        head_dim=head_dim,
+                        device=flat_unhit_v.device,
+                    )
+                else:
+                    unhit_k = flat_unhit_k
+                    unhit_v = flat_unhit_v
+
+                k_cache_tensor = torch.cat([cache_k, unhit_k], dim=0)
+                v_cache_tensor = torch.cat([cache_v, unhit_v], dim=0)
+            else:
+                k_cache_tensor = torch.cat(k_cache_buf, dim=0) if len(k_cache_buf) > 1 else k_cache_buf[0]
+                v_cache_tensor = torch.cat(v_cache_buf, dim=0) if len(v_cache_buf) > 1 else v_cache_buf[0]
+
+            # Make unhits become cached for the next step (GPU-cache mode only).
+            self._cache_manager.update_gpu_cache_with_new_tensor(self.layer_id, [k_cache_tensor], [v_cache_tensor])
+
+            k_cache_buf = k_cache_tensor
+            v_cache_buf = v_cache_tensor
+            self.unhit_id_map = None
 
         if not isinstance(k_cache_buf, TorchTensor):
             k_cache_buf = TorchTensor.create_from_torch(k_cache_buf, self.compute)
             v_cache_buf = TorchTensor.create_from_torch(v_cache_buf, self.compute)
 
+        # Avoid redundant dtype cast
         target_dtype = self.config.torch_dtype
         if k_cache_buf.data.dtype != target_dtype:
             k_cache_buf.data = k_cache_buf.data.to(target_dtype)
             v_cache_buf.data = v_cache_buf.data.to(target_dtype)
 
         if self.enable_prefetching:
-            partial_k_cache = partial_cache_read_buf.val
-            h_out, new_k_cache, new_v_cache, self.prefetch_idx = self.compute.mha_gen_qwen_infin_v2(
-                x, mask, w_q, w_k, w_v, w_out, w_ln, q_ln, k_ln,
-                n_head,
-                k_cache_buf, v_cache_buf,
-                donate,
-                self.policy.attn_sparsity, self.policy.compress_cache, self.policy.comp_cache_config,
-                self.config.rms_norm_eps, self.head_dim,
-                self.num_key_value_groups, self.num_key_value_heads,
-                None,
-                p_w_q, partial_k_cache, speculation_stream,
-                self.alpha, self.max_num_kv,
-                prefetch_grouped=True
-            )
+            if self.prefetch_algo == "quest":
+                h_out, new_k_cache, new_v_cache, self.prefetch_idx = self.compute.mha_gen_qwen_infin_v2(
+                    x, mask, w_q, w_k, w_v, w_out, w_ln, q_ln, k_ln,
+                    n_head,
+                    k_cache_buf, v_cache_buf,
+                    donate,
+                    self.policy.attn_sparsity, self.policy.compress_cache, self.policy.comp_cache_config,
+                    self.config.rms_norm_eps, self.head_dim,
+                    self.num_key_value_groups, self.num_key_value_heads,
+                    None,
+                    None, None, speculation_stream,
+                    self.alpha, self.max_num_kv,
+                    prefetch_grouped=True,
+                    quest_selector=self.quest_selector,
+                    quest_topk=self.quest_topk,
+                )
+            else:
+                partial_k_cache = partial_cache_read_buf.val
+                h_out, new_k_cache, new_v_cache, self.prefetch_idx = self.compute.mha_gen_qwen_infin_v2(
+                    x, mask, w_q, w_k, w_v, w_out, w_ln, q_ln, k_ln,
+                    n_head,
+                    k_cache_buf, v_cache_buf,
+                    donate,
+                    self.policy.attn_sparsity, self.policy.compress_cache, self.policy.comp_cache_config,
+                    self.config.rms_norm_eps, self.head_dim,
+                    self.num_key_value_groups, self.num_key_value_heads,
+                    None,
+                    p_w_q, partial_k_cache, speculation_stream,
+                    self.alpha, self.max_num_kv,
+                    prefetch_grouped=True
+                )
+
+            # Filter already-cached KV for the next layer.
+            if self.prefetch_idx is not None:
+                if isinstance(self.prefetch_idx, tuple):
+                    sparse_idx, pad_idx = self.prefetch_idx
+                    new_sparse_idx = self._cache_manager.cache_miss_check(self.layer_id + 1, sparse_idx)
+                    self.prefetch_idx = (new_sparse_idx, pad_idx)
+                else:
+                    self.prefetch_idx = self._cache_manager.cache_miss_check(self.layer_id + 1, self.prefetch_idx)
         else:
-            # fallback (if you have a non-v2 kernel, adapt here)
             h_out, new_k_cache, new_v_cache, _ = self.compute.mha_gen_qwen_infin_v2(
                 x, mask, w_q, w_k, w_v, w_out, w_ln, q_ln, k_ln,
                 n_head,
@@ -513,17 +603,12 @@ class SelfAttention:
                 self.alpha, self.max_num_kv
             )
 
-        if self.prefetch_idx is not None:
-            if isinstance(self.prefetch_idx, tuple):
-                sparse_idx, pad_idx = self.prefetch_idx
-                new_sparse_idx = self._cache_manager.cache_miss_check(self.layer_id + 1, sparse_idx)
-                self.prefetch_idx = (new_sparse_idx, pad_idx)
-            else:
-                self.prefetch_idx = self._cache_manager.cache_miss_check(self.layer_id + 1, self.prefetch_idx)
-
         cache_write_buf.store((new_k_cache, new_v_cache))
 
-        if (prev_partial_cache_read_buf is not None) and (self.layer_id > 1):
+        if self.prefetch_algo == "quest" and self.quest_selector is not None and (not warmup):
+            self.quest_selector.append_decode_kv(new_k_cache.data)
+
+        if (self.prefetch_algo == "infinigen") and (prev_partial_cache_read_buf is not None) and (self.layer_id > 1):
             prev_partial_cache_read_buf.val = torch.cat(
                 (prev_partial_cache_read_buf.val, set_partial_cache_gqa(
                     new_k_cache.data, self.partial_index, n_head,
@@ -544,6 +629,7 @@ class OptLM:
         partial_weight_ratio=0.2,
         alpha=4,
         max_num_kv=400,
+        prefetch_algo: str = "infinigen",
         gpu_cache_num: int = 0,
         gpu_cache_pred: float = 1.0,
         cpu_cache_pred: float = 1.0,
@@ -559,6 +645,7 @@ class OptLM:
         self.gpu_cache_num = int(gpu_cache_num)
         self.gpu_cache_pred = float(gpu_cache_pred)
         self.cpu_cache_pred = float(cpu_cache_pred)
+        self.prefetch_algo = prefetch_algo
 
         self.head_num = getattr(self.config, "num_key_value_heads", self.config.num_attention_heads)
         self.head_dim = getattr(self.config, "head_dim", self.config.hidden_size // self.config.num_attention_heads)
@@ -607,7 +694,8 @@ class OptLM:
                     self.config, self.env, self.policy, i, self._cache_manager,
                     enable_prefetching=enable_prefetching,
                     partial_weight_ratio=partial_weight_ratio,
-                    alpha=alpha, max_num_kv=max_num_kv
+                    alpha=alpha, max_num_kv=max_num_kv,
+                    prefetch_algo=self.prefetch_algo,
                 ))
                 self.attn_layer.append(len(self.layers) - 1)
                 self.layers.append(MLP(self.config, self.env, self.policy, i))
@@ -844,6 +932,8 @@ class OptLM:
                     if j > 0:
                         # Free previous layer activations to reduce peak memory.
                         self.hidden[i][j - 1][k].val = None
+                    if j == self.num_layers - 1:
+                        self.hidden[i][j][k].val = None
 
                     # schedule prefetch after attention layer decoding
                     if (j in self.attn_layer[1:-1]) and (i > 0):
@@ -991,6 +1081,7 @@ def run_flexgen(args):
         partial_weight_ratio=args.partial_weight_ratio,
         alpha=args.alpha,
         max_num_kv=args.max_num_kv,
+        prefetch_algo=args.prefetch_algo,
         gpu_cache_num=args.gpu_cache_num,
         gpu_cache_pred=args.gpu_cache_pred,
         cpu_cache_pred=args.cpu_cache_pred,
@@ -1001,13 +1092,12 @@ def run_flexgen(args):
     use_gpu_cache = args.gpu_cache_num != 0
     cache_device = "cuda:0" if use_gpu_cache else "cpu"
     for l in range(qwen_config.num_hidden_layers):
-        max_token_len = args.prompt_len + args.gen_len
         model._cache_manager.add_cache(
             device=cache_device,
             layer_id=l,
             batch_size=num_prompts,
             head_num=getattr(qwen_config, "num_key_value_heads", qwen_config.num_attention_heads),
-            max_token_len=max_token_len,
+            max_token_len=args.prompt_len + args.gen_len,
             sparse_len=int(args.max_num_kv + 32),
             hidden_size=head_dim,
             use_gpu_cache=use_gpu_cache,
@@ -1125,6 +1215,11 @@ def add_parser_arguments(parser):
     parser.add_argument("--alpha", type=int, default=4)
     parser.add_argument("--partial-weight-ratio", type=float, default=0.2)
     parser.add_argument("--max-num-kv", type=int, default=400)
+    # NOTE: 为了做到直接 `bash my_cache_bench.sh` 就跑 Qwen 的 quest，
+    # 这里默认使用 quest；需要 infinigen 时显式传 `--prefetch-algo infinigen`。
+    parser.add_argument("--prefetch-algo", type=str, default="quest",
+                        choices=["infinigen", "quest"],
+                        help="Prefetch algorithm: quest or infinigen (partial-weight).")
     parser.add_argument("--gpu-cache-num", type=int, default=0,
                         help="GPU cache pool 的数量/分片数；为 0 时使用 CPU cache pool")
     parser.add_argument("--gpu-cache-pred", type=float, default=1.0,

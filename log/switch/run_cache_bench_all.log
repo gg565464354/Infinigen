@@ -1,0 +1,37 @@
+===== Version: qwen_infinigen_cache_cpu =====
+DRY_RUN=1, skip bench for qwen_infinigen_cache_cpu
+===== Version: qwen_infinigen_cache_gpu =====
+DRY_RUN=1, skip bench for qwen_infinigen_cache_gpu
+===== Version: qwen_infinigen_original =====
+DRY_RUN=1, skip bench for qwen_infinigen_original
+===== Version: qwen_infinigen_straw =====
+DRY_RUN=1, skip bench for qwen_infinigen_straw
+===== Version: qwen_quest_cache_cpu =====
+DRY_RUN=1, skip bench for qwen_quest_cache_cpu
+===== Version: qwen_quest_cache_gpu =====
+DRY_RUN=1, skip bench for qwen_quest_cache_gpu
+===== Version: qwen_quest_original =====
+DRY_RUN=1, skip bench for qwen_quest_original
+===== Version: qwen_quest_straw =====
+DRY_RUN=1, skip bench for qwen_quest_straw
+===== Version: qwen_infinigen_cache_cpu =====
+===== Version: qwen_infinigen_cache_gpu =====
+===== Version: qwen_infinigen_cache_gpu DONE =====
+===== Version: qwen_infinigen_original =====
+===== Version: qwen_infinigen_straw =====
+===== Version: qwen_infinigen_straw DONE =====
+===== Version: qwen_quest_cache_cpu =====
+===== Version: qwen_quest_cache_cpu =====
+===== Version: qwen_quest_cache_cpu =====
+===== Version: qwen_quest_cache_cpu DONE =====
+===== Version: qwen_quest_cache_gpu =====
+===== Version: qwen_quest_cache_gpu DONE =====
+===== Version: qwen_quest_original =====
+===== Version: qwen_quest_original DONE =====
+===== Version: qwen_quest_straw =====
+===== Version: qwen_quest_straw DONE =====
+===== Version: qwen_quest_cache_cpu =====
+===== Version: qwen_infinigen =====
+===== Version: qwen_infinigen =====
+===== Version: qwen_infinigen =====
+===== Version: qwen_infinigen DONE =====

@@ -281,22 +281,8 @@ class CacheManager:
         group_final_v = []
 
         # Step 1: 获取未命中KV
-        if prefetch_idx is None or prefetch_idx.numel() == 0:
-            for i in range(len(group_cached_gpu_k)):
-                cached_k = group_cached_gpu_k[i]
-                cached_v = group_cached_gpu_v[i]
-                empty_shape = (0, cached_k.shape[1], cached_k.shape[2])
-                empty_k = torch.empty(empty_shape, device=cached_k.device, dtype=cached_k.dtype)
-                empty_v = torch.empty(empty_shape, device=cached_v.device, dtype=cached_v.dtype)
-                group_final_k.append((cached_k, empty_k))
-                group_final_v.append((cached_v, empty_v))
-            return group_final_k, group_final_v, None
-
         prefetch_idx_int = prefetch_idx.squeeze(1).to(torch.int32)
-        if pad_idx is None or pad_idx.numel() == 0:
-            pad_idx_list = prefetch_idx[0][0].tolist()
-        else:
-            pad_idx_list = pad_idx[0][0].tolist()
+        pad_idx_list = prefetch_idx[0][0].tolist()
         group_unhit = cur_cache.get_unhit_kv_tensor_v7(
             prefetch_idx_int, 
             pad_idx_list,

@@ -1,0 +1,6 @@
+version,bsz,total_throughput
+qwen_infinigen_cache_cpu,1,9.135
+qwen_infinigen_cache_cpu,8,23.952
+qwen_infinigen_cache_cpu,16,19.534
+qwen_infinigen_cache_cpu,24,20.367
+qwen_infinigen_cache_cpu,32,19.882
