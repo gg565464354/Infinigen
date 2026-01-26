@@ -1,1 +1,4 @@
-===== Running with --prompt-len 8196 --max-num-kv 2048 --gpu-batch-size 1 =====
+===== Running with --prompt-len 8196 --max-num-kv 2048 --gpu-batch-size 6 =====
+
+
+

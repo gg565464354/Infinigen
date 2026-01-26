@@ -962,7 +962,7 @@ def run_flexgen(args):
                     warmup=False
                 )
             prof.export_chrome_trace(
-                f"/root/Infinigen/speedup/profile_mycache_gpu_b{args.gpu_batch_size}_i{args.prompt_len}_o{args.gen_len}.json"
+                f"/root/Infinigen/speedup/v2_profile_mycache_gpu_b{args.gpu_batch_size}_i{args.prompt_len}_o{args.gen_len}.json"
             )
             costs = timers("generate").costs
         else:
