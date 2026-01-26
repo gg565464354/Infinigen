@@ -136,6 +136,40 @@ def repeat_kv_cache(x: torch.Tensor, n_rep: int, n_kv_head: int):
     x = x.reshape(s, b * (n_kv_head * n_rep), d)
     return x
 
+
+def speculate_attention_gqa(hidden, p_w_q, p_k_c, n_head, n_kv_head, alpha, max_num_kv):
+    if n_kv_head is None or n_kv_head == n_head:
+        return speculate_attention(hidden, p_w_q, p_k_c, n_head, alpha, max_num_kv)
+
+    b = hidden.shape[0]
+    p_q = F.linear(hidden, p_w_q, bias=None)
+    p_q = p_q.view(b, 1, n_head, -1)
+    p_q = p_q.permute(0, 2, 1, 3).reshape(b * n_head, 1, -1)
+
+    p_attn = torch.bmm(p_q, p_k_c.permute(1, 2, 0))  # (b*n_head, 1, n)
+    n = p_attn.shape[-1]
+    if n == 0:
+        return None
+
+    if n_head % n_kv_head != 0:
+        raise ValueError(f"n_head ({n_head}) must be divisible by n_kv_head ({n_kv_head})")
+    rep = n_head // n_kv_head
+    p_attn = p_attn.view(b, n_head, n).view(b, n_kv_head, rep, n).mean(dim=2)
+    p_attn = p_attn.reshape(b * n_kv_head, 1, n)
+
+    max_ = torch.max(p_attn, dim=-1)[0]
+    thr_ = (max_ - alpha).unsqueeze(-1).repeat(1, 1, p_attn.shape[-1])
+    count = torch.where(
+        p_attn > thr_, torch.ones_like(p_attn), torch.zeros_like(p_attn)
+    )
+    mean = torch.mean(torch.sum(count, dim=-1)).item()
+    topk = min(int(mean), max_num_kv)
+    if topk <= 0:
+        return None
+
+    prefetch_idx = torch.topk(p_attn.permute(2, 1, 0), topk, dim=0)[1]
+    return prefetch_idx
+
 def rms_norm(input: torch.Tensor, weight: torch.Tensor, eps: float = 1e-6):
     input_dtype = input.dtype
     # 计算 RMS（Root Mean Square）

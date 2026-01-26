@@ -4,13 +4,13 @@
 # 设置要测试的 gpu-batch-size 值列表
 # batch_sizes=(24 25 26 27 28 29 30 31 32)
 # batch_sizes=(12 13 14 15 16)
-# batch_sizes=1
-batch_sizes=(1 2 3 4 5 6)
+batch_sizes=1
+# batch_sizes=(1 2 3 4 5 6)
 # batch_sizes=(8)
 prompt_len=8196
 max_kv=2048
-# gen_len=10
-gen_len=512
+gen_len=10
+# gen_len=512
 
 # gpu_cache_num=30
 # gpu_cache_num=0
@@ -40,9 +40,9 @@ for batch_size in "${batch_sizes[@]}"; do
         --alpha 4 \
         --partial-weight-ratio 0.2 \
         --max-num-kv "$max_kv" \
-        --gpu-cache-num 0 \
-        --gpu-cache-pred 2 \
-        --cpu-cache-pred 1.25 \
+        # --gpu-cache-num 0 \
+        # --gpu-cache-pred 2 \
+        # --cpu-cache-pred 1.25 \
         2>&1 | tee -a "$LOG_FILE"
     
     echo -e "\n\n" | tee -a "$LOG_FILE"

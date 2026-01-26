@@ -38,7 +38,7 @@ from flexgen.utils import (
 
 from infinigen.kv_selection_controller import select_kv
 from infinigen.partial_weight_generation_controller import (
-    set_partial_cache_gqa, set_partial_weight
+    set_partial_cache, set_partial_cache_gqa, set_partial_weight
 )
 
 from safetensors.torch import load_file
@@ -185,25 +185,10 @@ class MLP:
         x = hidden.val
         w = weight_read_buf.val
         x = rms_norm(x, w["norm_weight"], eps=self.config.rms_norm_eps)
-        # Chunk long sequences to reduce peak MLP activation memory.
-        chunk_size = int(os.environ.get("FLEXGEN_MLP_CHUNK_SIZE", "1024"))
-        if x.dim() == 3 and chunk_size > 0 and x.shape[1] > chunk_size:
-            out = torch.empty_like(x)
-            for start in range(0, x.shape[1], chunk_size):
-                end = min(start + chunk_size, x.shape[1])
-                x_chunk = x[:, start:end, :]
-                gate = F.linear(x_chunk, w["gate_proj_weight"])
-                up = F.linear(x_chunk, w["up_proj_weight"])
-                up = F.silu(up, inplace=True)
-                gate.mul_(up)
-                out[:, start:end, :] = F.linear(gate, w["down_proj_weight"])
-            hidden.val = out
-            return
         gate = F.linear(x, w["gate_proj_weight"])
         up = F.linear(x, w["up_proj_weight"])
-        up = F.silu(up, inplace=True)
-        gate.mul_(up)
-        x = F.linear(gate, w["down_proj_weight"])
+        x = gate * F.silu(up)
+        x = F.linear(x, w["down_proj_weight"])
         hidden.val = x
 
 
@@ -266,6 +251,14 @@ class SelfAttention:
         if weight_home.val["k_norm_weight"] is not None:
             weight_home.val["k_norm_weight"] = weight_home.val["k_norm_weight"].to(device, dtype)
 
+    def _set_partial_cache(self, k_cache, partial_index):
+        if self.num_key_value_heads != self.num_attention_heads:
+            return set_partial_cache_gqa(
+                k_cache, partial_index, self.num_attention_heads,
+                self.num_key_value_heads, self.head_dim
+            )
+        return set_partial_cache(k_cache, partial_index, self.num_attention_heads, self.head_dim)
+
     def init_cache_one_gpu_batch(self, cache_home: ValueHolder):
         if self.policy.cache_gpu_percent == 100:
             device = self.env.gpu
@@ -288,11 +281,11 @@ class SelfAttention:
                   flush=True)
 
         if self.layer_id > 1:
-            cache_dtype = k_cache.dtype if hasattr(k_cache, "dtype") else self.config.torch_dtype
+            # temp buffer for select_kv -> copy
+            # shape: (2, max_num_kv, b*kv_heads, head_dim)
             self.prefetch_kv = device.allocate(
                 (2, self.max_num_kv, k_cache.shape[1], k_cache.shape[2]),
-                cache_dtype,
-                pin_memory=True,
+                torch.bfloat16, pin_memory=True
             )
 
     def load_cache(self, cache_home, cache_read_buf, i: int):
@@ -306,46 +299,21 @@ class SelfAttention:
             v_home.smart_copy(dst, indices),
         ))
 
-    def prefetch_cache(
-        self, cache_home, cache_read_buf, i: int, prefetch_idx: torch.Tensor,
-        prefetch_cache_stream: torch.cuda.Stream
-    ):
+    def prefetch_cache(self, cache_home, cache_read_buf, i: int, prefetch_idx: torch.Tensor, prefetch_cache_stream: torch.cuda.Stream):
         if i == 0:
             return
-        real_prefetch_idx = prefetch_idx[0] if isinstance(prefetch_idx, tuple) else prefetch_idx
-        if real_prefetch_idx is None or real_prefetch_idx.numel() == 0:
-            return
-
         k_home, v_home = cache_home.val
         dst = self.attention_compute
 
-        L = int(real_prefetch_idx.shape[0])
+        # select subset KV: (len_idx, b*kv_heads, head_dim)
+        L = int(prefetch_idx.shape[0])
         indices = (slice(0, L), slice(0, k_home.shape[1]))
 
-        if self.prefetch_kv is None or L > self.prefetch_kv.shape[1]:
-            cache_dtype = k_home.dtype if hasattr(k_home, "dtype") else self.config.torch_dtype
-            self.prefetch_kv = k_home.device.allocate(
-                (2, L, k_home.shape[1], k_home.shape[2]),
-                cache_dtype,
-                pin_memory=True,
-            )
+        # fill temp buffer on k_home.device
+        self.prefetch_kv.data[0, :L], self.prefetch_kv.data[1, :L] = select_kv(prefetch_idx, k_home.data, v_home.data)
 
-        self.prefetch_kv.data[0, :L], self.prefetch_kv.data[1, :L] = select_kv(
-            real_prefetch_idx, k_home.data, v_home.data
-        )
-
-        k_c = TorchTensor(
-            (L, k_home.shape[1], k_home.shape[2]),
-            k_home.dtype,
-            self.prefetch_kv.data[0, :L],
-            k_home.device,
-        )
-        v_c = TorchTensor(
-            (L, v_home.shape[1], v_home.shape[2]),
-            v_home.dtype,
-            self.prefetch_kv.data[1, :L],
-            v_home.device,
-        )
+        k_c = TorchTensor((L, k_home.shape[1], k_home.shape[2]), k_home.dtype, self.prefetch_kv.data[0, :L], k_home.device)
+        v_c = TorchTensor((L, v_home.shape[1], v_home.shape[2]), v_home.dtype, self.prefetch_kv.data[1, :L], v_home.device)
 
         with torch.cuda.stream(prefetch_cache_stream):
             cache_read_buf.store((
@@ -418,12 +386,7 @@ class SelfAttention:
 
             # store partial into "prev" buffers (pipeline design)
             if (prev_partial_cache_read_buf is not None) and (not warmup):
-                prev_partial_cache_read_buf.store(
-                    set_partial_cache_gqa(
-                        new_k_cache.data, self.partial_index, n_head,
-                        self.num_key_value_heads, head_dim
-                    )
-                )
+                prev_partial_cache_read_buf.store(self._set_partial_cache(new_k_cache.data, self.partial_index))
                 prev_partial_weight_read_buf.store(set_partial_weight(w_q_upd.data, self.partial_index, n_head, head_dim))
 
             # warmup may update weights
@@ -441,10 +404,8 @@ class SelfAttention:
             k_cache_buf = TorchTensor.create_from_torch(k_cache_buf, self.compute)
             v_cache_buf = TorchTensor.create_from_torch(v_cache_buf, self.compute)
 
-        target_dtype = self.config.torch_dtype
-        if k_cache_buf.data.dtype != target_dtype:
-            k_cache_buf.data = k_cache_buf.data.to(target_dtype)
-            v_cache_buf.data = v_cache_buf.data.to(target_dtype)
+        k_cache_buf.data = k_cache_buf.data.to(torch.bfloat16)
+        v_cache_buf.data = v_cache_buf.data.to(torch.bfloat16)
 
         if self.enable_prefetching:
             partial_k_cache = partial_cache_read_buf.val
@@ -458,8 +419,7 @@ class SelfAttention:
                 self.num_key_value_groups, self.num_key_value_heads,
                 None,
                 p_w_q, partial_k_cache, speculation_stream,
-                self.alpha, self.max_num_kv,
-                prefetch_grouped=False
+                self.alpha, self.max_num_kv
             )
         else:
             # fallback (if you have a non-v2 kernel, adapt here)
@@ -476,17 +436,11 @@ class SelfAttention:
                 self.alpha, self.max_num_kv
             )
 
-        if self.prefetch_idx is not None and isinstance(self.prefetch_idx, tuple):
-            self.prefetch_idx = self.prefetch_idx[0]
-
         cache_write_buf.store((new_k_cache, new_v_cache))
 
         if (prev_partial_cache_read_buf is not None) and (self.layer_id > 1):
             prev_partial_cache_read_buf.val = torch.cat(
-                (prev_partial_cache_read_buf.val, set_partial_cache_gqa(
-                    new_k_cache.data, self.partial_index, n_head,
-                    self.num_key_value_heads, head_dim
-                ))
+                (prev_partial_cache_read_buf.val, self._set_partial_cache(new_k_cache.data, self.partial_index))
             )
 
         hidden.val = h_out.data
@@ -501,10 +455,7 @@ class OptLM:
         policy: Policy,
         partial_weight_ratio=0.2,
         alpha=4,
-        max_num_kv=400,
-        gpu_cache_num: int = 0,
-        gpu_cache_pred: float = 1.0,
-        cpu_cache_pred: float = 1.0,
+        max_num_kv=400
     ):
         if isinstance(config, str):
             config = get_opt_config(config)
@@ -514,9 +465,6 @@ class OptLM:
         self.path = path
         self.policy = policy
         self.num_gpu_batches = policy.num_gpu_batches
-        self.gpu_cache_num = int(gpu_cache_num)
-        self.gpu_cache_pred = float(gpu_cache_pred)
-        self.cpu_cache_pred = float(cpu_cache_pred)
 
         # ---- load state_dict from safetensors ----
         print(f"Loading model from safetensors in: {path}")
@@ -785,9 +733,6 @@ class OptLM:
 
                     self.store_hidden(i, j, k)
                     self.store_cache(i, j, k, overlap=False)
-                    if j > 0:
-                        # Free previous layer activations to reduce peak memory.
-                        self.hidden[i][j - 1][k].val = None
 
                     # schedule prefetch after attention layer decoding
                     if (j in self.attn_layer[1:-1]) and (i > 0):
@@ -796,7 +741,6 @@ class OptLM:
 
             timers("generate").stop()
 
-    @torch.no_grad()
     def generate(
         self,
         inputs: Union[np.ndarray, List[List[int]]],
@@ -934,52 +878,24 @@ def run_flexgen(args):
         qwen_config, env, args.path, policy,
         partial_weight_ratio=args.partial_weight_ratio,
         alpha=args.alpha,
-        max_num_kv=args.max_num_kv,
-        gpu_cache_num=args.gpu_cache_num,
-        gpu_cache_pred=args.gpu_cache_pred,
-        cpu_cache_pred=args.cpu_cache_pred,
+        max_num_kv=args.max_num_kv
     )
 
-    use_profile = True  # toggle for torch.profiler runs
     try:
-        if use_profile:
-            from torch.profiler import profile, ProfilerActivity
-            activities = [ProfilerActivity.CPU, ProfilerActivity.CUDA]
+        print("warmup - generate")
+        _ = model.generate(warmup_inputs, max_new_tokens=1, verbose=args.verbose, warmup=True)
 
-            print("warmup - generate")
-            _ = model.generate(warmup_inputs, max_new_tokens=1, verbose=args.verbose, warmup=True)
-            torch.cuda.synchronize()
-
-            print("benchmark - generate")
-            timers("generate").reset()
-            with profile(activities=activities, with_stack=True) as prof:
-                output_ids = model.generate(
-                    inputs,
-                    max_new_tokens=args.gen_len,
-                    debug_mode=args.debug_mode,
-                    cut_gen_len=args.cut_gen_len,
-                    verbose=args.verbose,
-                    warmup=False
-                )
-            prof.export_chrome_trace(
-                f"/root/Infinigen/speedup/profile_mycache_gpu_b{args.gpu_batch_size}_i{args.prompt_len}_o{args.gen_len}.json"
-            )
-            costs = timers("generate").costs
-        else:
-            print("warmup - generate")
-            _ = model.generate(warmup_inputs, max_new_tokens=1, verbose=args.verbose, warmup=True)
-
-            print("benchmark - generate")
-            timers("generate").reset()
-            output_ids = model.generate(
-                inputs,
-                max_new_tokens=args.gen_len,
-                debug_mode=args.debug_mode,
-                cut_gen_len=args.cut_gen_len,
-                verbose=args.verbose,
-                warmup=False
-            )
-            costs = timers("generate").costs
+        print("benchmark - generate")
+        timers("generate").reset()
+        output_ids = model.generate(
+            inputs,
+            max_new_tokens=args.gen_len,
+            debug_mode=args.debug_mode,
+            cut_gen_len=args.cut_gen_len,
+            verbose=args.verbose,
+            warmup=False
+        )
+        costs = timers("generate").costs
     finally:
         env.close_copy_threads()
 
@@ -992,8 +908,14 @@ def run_flexgen(args):
     decode_throughput = num_prompts * (args.gen_len - 1) / max(decode_latency, 1e-10)
     total_latency = prefill_latency + decode_latency
     total_throughput = (num_prompts * args.gen_len) / total_latency
-    _, gpu_peak_mem = gpu.mem_stats()
-    _, cpu_peak_mem = cpu.mem_stats()
+    if hasattr(gpu, "mem_stats"):
+        _, gpu_peak_mem = gpu.mem_stats()
+    else:
+        gpu_peak_mem = torch.cuda.max_memory_allocated(gpu.dev) if torch.cuda.is_available() else 0
+    if hasattr(cpu, "mem_stats"):
+        _, cpu_peak_mem = cpu.mem_stats()
+    else:
+        cpu_peak_mem = 0
 
     if DUMMY_WEIGHT not in args.path:
         outputs = tokenizer.batch_decode(output_ids, skip_special_tokens=True)
@@ -1003,8 +925,10 @@ def run_flexgen(args):
                 print(f"{i}: {outputs[i]}")
                 print(70 * "-")
 
-    gpu.print_stats()
-    cpu.print_stats()
+    if hasattr(gpu, "print_stats"):
+        gpu.print_stats()
+    if hasattr(cpu, "print_stats"):
+        cpu.print_stats()
 
     filename = get_filename(args) + ".log" if args.log_file == "auto" else args.log_file
     log_str = write_benchmark_log(
@@ -1052,13 +976,6 @@ def add_parser_arguments(parser):
     parser.add_argument("--alpha", type=int, default=4)
     parser.add_argument("--partial-weight-ratio", type=float, default=0.2)
     parser.add_argument("--max-num-kv", type=int, default=400)
-    parser.add_argument("--gpu-cache-num", type=int, default=0,
-                        help="GPU cache pool 的数量/分片数；为 0 时使用 CPU cache pool")
-    parser.add_argument("--gpu-cache-pred", type=float, default=1.0,
-                        help="GPU cache 容量倍率，相对于 max-num-kv")
-    parser.add_argument("--cpu-cache-pred", type=float, default=1.0,
-                        help="CPU cache 容量倍率，相对于 max-num-kv")
- 
 
     parser.add_argument("--warmup-input-path", type=str, required=True)
     parser.add_argument("--test-input-path", type=str, required=True)
