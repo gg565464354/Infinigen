@@ -5,7 +5,7 @@
 # batch_sizes=(24 25 26 27 28 29 30 31 32)
 # batch_sizes=(12 13 14 15 16)
 # batch_sizes=1
-batch_sizes=(1 8 16 24 32)
+batch_sizes=(1 2 3 4 5 6)
 # batch_sizes=(8)
 prompt_len=8196
 max_kv=2048
@@ -35,14 +35,14 @@ for batch_size in "${batch_sizes[@]}"; do
         --num-gpu-batches 1 \
         --prompt-len "$prompt_len" \
         --gen-len "$gen_len" \
-        --warmup-input-path /root/InfiniGen/speedup/flexgen/pg19_firstbook.txt \
-        --test-input-path /root/InfiniGen/speedup/flexgen/pg19_firstbook.txt \
+        --warmup-input-path /root/Infinigen/speedup/flexgen/pg19_firstbook.txt \
+        --test-input-path /root/Infinigen/speedup/flexgen/pg19_firstbook.txt \
         --alpha 4 \
         --partial-weight-ratio 0.2 \
         --max-num-kv "$max_kv" \
         --gpu-cache-num 0 \
         --gpu-cache-pred 2 \
-        --cpu-cache-pred 2 \
+        --cpu-cache-pred 1.25 \
         2>&1 | tee -a "$LOG_FILE"
     
     echo -e "\n\n" | tee -a "$LOG_FILE"
